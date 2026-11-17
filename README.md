@@ -24,6 +24,7 @@ index.html              Página web (consulta individual + procesamiento de Exce
 api/buscar.py           Función de Vercel: busca UN producto (la página la llama por cada fila)
 api/imagen.py           Función de Vercel: descarga imágenes para el ZIP y las miniaturas del Excel
 api/estado.py           Función de Vercel: pide clave / diagnóstico de las fuentes
+api/candidatas.py       Función de Vercel: opciones de fotos y productos para la pantalla de revisión
 buscador_productos.py   Lógica de búsqueda (la usan la web, la consola y Gradio)
 vercel.json             Configuración de Vercel (región São Paulo, tiempo máximo)
 requirements.txt        Librerías que instala Vercel
@@ -72,7 +73,20 @@ Cada `git push` a `main` vuelve a publicar la web automáticamente.
 - Se puede pausar y descargar el Excel parcial en cualquier momento.
 - Si el archivo tiene una columna con EAN, se usa para buscar la imagen exacta por código.
 - Columnas que agrega: `EAN`, `EAN_Valido`, `Imagen_URL`, `Match_Nombre`, `Marca`, `Fuente_EAN`, `Fuente_Imagen`, `Score_Match`, `Validacion_IA`, `Estado` (OK / Parcial / No encontrado) y `Revisar` (motivos para chequear a mano).
+- Columnas con datos del producto (de la tienda donde se encontró): `Categoria` (ej. "Bebidas > Gaseosas > Gaseosas cola"), `Contenido_Neto` (ej. "473 ml"), `Descripcion`, `Link_Producto`. La `Marca` sale normalizada ("CAMPO AUSTRAL" → "Campo Austral").
 - Con **Miniaturas en el Excel** (activado por defecto), el Excel descargado trae una primera columna `Foto` con la imagen de cada producto.
+- Con **Fotos listas para publicar** (activado por defecto), el ZIP trae cada foto recortada, centrada en un cuadrado de 1000×1000 con fondo blanco, en JPG y nombrada por EAN. Sirven directo para tienda online, MercadoLibre o catálogo.
+
+## Pantalla de revisión
+
+La pestaña **🧐 Revisión** muestra solo los productos incompletos o marcados para revisar (el número al lado es cuántos quedan). Para cada uno:
+
+- Aparecen las opciones de todas las tiendas (con su EAN, nombre y foto) y fotos de la web. **Un clic** en la correcta y queda aplicada, con su EAN y sus datos.
+- Si ninguna sirve: **cargar el EAN a mano** (busca la foto y los datos de ese código) o **pegar la URL** de una imagen.
+- **✓ Está bien así** lo marca como revisado sin cambiar nada.
+
+Las correcciones se guardan en el navegador junto con el avance, salen en el Excel (columna `Revisado_Manual`) y en el ZIP.
+En la consulta individual, el botón **🔄 Ver otras opciones** muestra las mismas alternativas.
 
 ## Validación de fotos con IA
 
@@ -110,6 +124,7 @@ python buscador_productos.py --producto "DR LEMON POMELO x473 ml" --validar-ia t
 | `--miniaturas` | Columna `Foto` con la miniatura de cada imagen en el Excel |
 | `--validar-ia web\|todas` | Validar fotos con IA (requiere `ANTHROPIC_API_KEY`) |
 | `--download-images` | Guardar las imágenes en la carpeta `--images-dir` |
+| `--fotos-publicar` | Fotos 1000×1000, fondo blanco, nombradas por EAN, en `<images-dir>/publicar` |
 | `--solo-oficiales` | Solo fotos de catálogos, nunca de la web |
 | `--reintentar` | Volver a buscar las filas que quedaron incompletas |
 | `--limit N` | Procesar solo las primeras N filas (para probar) |

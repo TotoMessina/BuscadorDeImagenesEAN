@@ -19,6 +19,7 @@ from buscador_productos import (
     guardar_tabla,
     detectar_columna,
     guardar_excel_con_miniaturas,
+    exportar_fotos_publicar,
     ia_disponible,
     MODELO_VISION,
     COLUMNAS_NOMBRE_POSIBLES,
@@ -110,7 +111,8 @@ def previsualizar_archivo(archivo):
 
 
 def procesar_lote(archivo, columna, columna_ean, modo_txt, descargar_fotos, serper_key, max_filas,
-                  solo_oficiales=False, ia_txt="No validar", miniaturas=True, progress=gr.Progress()):
+                  solo_oficiales=False, ia_txt="No validar", miniaturas=True, fotos_publicar=True,
+                  progress=gr.Progress()):
     """Procesa el lote completo con barra de progreso."""
     if archivo is None:
         raise gr.Error("Tenés que cargar un archivo Excel o CSV.")
@@ -149,6 +151,13 @@ def procesar_lote(archivo, columna, columna_ean, modo_txt, descargar_fotos, serp
         guardar_excel_con_miniaturas(
             df, ruta_excel,
             on_progreso=lambda i, n: progress(i / n, desc=f"Agregando miniaturas al Excel {i}/{n}"),
+        )
+
+    if fotos_publicar and descargar_fotos and modo != "ean":
+        carpeta_imgs = os.path.join(carpeta_corrida, "fotos_1000x1000")
+        exportar_fotos_publicar(
+            df, carpeta_imgs, columna,
+            on_progreso=lambda i, n: progress(i / n, desc=f"Preparando fotos para publicar {i}/{n}"),
         )
 
     zip_ruta = None
@@ -226,6 +235,9 @@ with gr.Blocks(title="Buscador de EAN e Imágenes") as demo:
                     modo_lote = gr.Radio(list(OPCIONES_MODO), value="EAN + Imagen", label="¿Qué buscar?")
                     descargar_check = gr.Checkbox(label="Descargar imágenes (ZIP)", value=True)
                     miniaturas_check = gr.Checkbox(label="🖼️ Miniaturas de las fotos dentro del Excel", value=True)
+                    publicar_check = gr.Checkbox(
+                        label="📸 Fotos listas para publicar en el ZIP", value=True,
+                        info="Recortadas, cuadradas 1000×1000, fondo blanco, nombradas por EAN")
                     ia_lote = gr.Radio(list(OPCIONES_IA), value="No validar", label="🤖 Validar fotos con IA",
                                        info=AYUDA_IA, interactive=ia_disponible())
                     solo_oficiales_check = gr.Checkbox(
@@ -253,7 +265,8 @@ with gr.Blocks(title="Buscador de EAN e Imágenes") as demo:
             btn_procesar.click(
                 fn=procesar_lote,
                 inputs=[archivo_input, columna_dropdown, columna_ean_dropdown, modo_lote, descargar_check,
-                        serper_key_input, max_filas_input, solo_oficiales_check, ia_lote, miniaturas_check],
+                        serper_key_input, max_filas_input, solo_oficiales_check, ia_lote, miniaturas_check,
+                        publicar_check],
                 outputs=[descarga_excel, descarga_zip, tabla_resultados, resumen_texto],
             )
 

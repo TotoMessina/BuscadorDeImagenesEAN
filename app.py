@@ -20,7 +20,7 @@ for ruta in (RAIZ, CARPETA_API):
     if ruta not in sys.path:
         sys.path.insert(0, ruta)
 
-FUNCIONES = ("buscar", "estado", "imagen")
+FUNCIONES = ("buscar", "estado", "imagen", "candidatas")
 _handlers = {}
 
 

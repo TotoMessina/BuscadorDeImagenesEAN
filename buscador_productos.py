@@ -129,6 +129,7 @@ PRIORIDAD_TIENDA = {nombre: i for i, (nombre, _) in enumerate(TIENDAS_VTEX)}
 COLUMNAS_RESULTADO = [
     "EAN", "EAN_Valido", "Imagen_URL", "Imagen_Local", "Match_Nombre", "Marca",
     "Fuente_EAN", "Fuente_Imagen", "Score_Match", "Validacion_IA", "Estado", "Revisar",
+    "Categoria", "Contenido_Neto", "Descripcion", "Link_Producto",
 ]
 
 # Sesión HTTP con reutilización de conexiones TLS (compartida entre hilos)
@@ -320,6 +321,56 @@ def _datos_sku(sku):
     return ean, img_url
 
 
+_UNIDAD_MOSTRAR = {"kg": "kg", "kgs": "kg", "kgr": "kg", "kgrs": "kg", "g": "g", "gr": "g", "grs": "g",
+                   "mg": "mg", "ml": "ml", "cc": "ml", "cm3": "ml", "l": "l", "lt": "l", "lts": "l"}
+
+
+def formatear_contenido(texto):
+    """Contenido neto legible a partir de un nombre: 'Dr Lemon lata 473 cc.' -> '473 ml', '2,25 lts' -> '2,25 l'."""
+    t = normalizar_texto(texto)
+    m = re.search(r'(?<![\d.,])(\d+(?:[.,]\d+)?)\s*(' + _UNIDADES + r')(?![a-z])', t)
+    if not m:
+        return None
+    numero = m.group(1).replace('.', ',')
+    if ',' in numero:
+        numero = numero.rstrip('0').rstrip(',')
+    return f"{numero} {_UNIDAD_MOSTRAR.get(m.group(2), m.group(2))}"
+
+
+def normalizar_marca(marca):
+    """'CAMPO AUSTRAL' -> 'Campo Austral'. Respeta marcas que ya vienen con mayúsculas y minúsculas ('Dr. Lemon')."""
+    marca = re.sub(r'\s+', ' ', str(marca or '')).strip()
+    if not marca:
+        return None
+    if marca.isupper() or marca.islower():
+        marca = " ".join(p if len(p) <= 2 and p.isupper() and "." not in p else p.capitalize() for p in marca.split(" "))
+    return marca
+
+
+def _texto_plano(html, largo=600):
+    texto = re.sub(r'<[^>]+>', ' ', str(html or ''))
+    texto = re.sub(r'&nbsp;|&#160;', ' ', texto)
+    texto = re.sub(r'\s+', ' ', texto).strip()
+    return (texto[:largo - 1] + "…") if len(texto) > largo else (texto or None)
+
+
+def _datos_producto(prod, sku):
+    """Datos extra de un producto VTEX: categoría, contenido neto, descripción y link."""
+    categorias = prod.get('categories') or []
+    categoria = None
+    if categorias:
+        partes = [p for p in str(categorias[0]).split('/') if p.strip()]  # la primera es la más específica
+        categoria = " > ".join(partes) or None
+    nombre_sku = (sku or {}).get('nameComplete') or (sku or {}).get('name') or prod.get('productName')
+    return {
+        "categoria": categoria,
+        "contenido": formatear_contenido(nombre_sku) or formatear_contenido(prod.get('productName')),
+        "descripcion": _texto_plano(prod.get('description') or prod.get('metaTagDescription')),
+        "link": prod.get('link'),
+        "marca": normalizar_marca(prod.get('brand')),
+    }
+
+
 def _elegir_sku(producto, tamano_query):
     """Entre las variantes (SKUs) de un producto, elige la que coincide con el gramaje buscado."""
     skus = producto.get('items') or []
@@ -341,9 +392,12 @@ def _cumple_modo(ean, img_url, modo):
     return bool(ean or img_url)
 
 
-def _buscar_en_tienda(nombre_tienda, dominio, queries, nombre_limpio, tamano_query, modo):
-    """Busca en una tienda VTEX y devuelve su mejor candidato (o None)."""
-    mejor = None
+def _evaluar_tienda(nombre_tienda, dominio, queries, nombre_limpio, tamano_query, score_minimo, alcanza, max_productos=5):
+    """
+    Busca en una tienda VTEX y devuelve todos los productos con score >= score_minimo.
+    Prueba las queries en orden y corta cuando alcanza(lista) es True.
+    """
+    lista = []
     for q in queries:
         url = f"https://{dominio}/api/catalog_system/pub/products/search/{requests.utils.quote(q)}"
         try:
@@ -354,29 +408,46 @@ def _buscar_en_tienda(nombre_tienda, dominio, queries, nombre_limpio, tamano_que
         except Exception:
             continue
 
-        for prod in productos[:5]:
+        for prod in productos[:max_productos]:
             sku = _elegir_sku(prod, tamano_query)
             if not sku:
                 continue
             nombre_sku = sku.get('nameComplete') or sku.get('name')
             score = calcular_score_coincidencia(nombre_limpio, prod, tamano_query, nombre_sku)
-            if score < SCORE_MINIMO:
+            if score < score_minimo:
                 continue
             ean, img_url = _datos_sku(sku)
-            if not _cumple_modo(ean, img_url, modo):
-                continue
-            if mejor is None or score > mejor["score"]:
-                mejor = {
-                    "ean": ean,
-                    "imagen_url": img_url,
-                    "match_nombre": nombre_sku or prod.get('productName'),
-                    "marca": prod.get('brand'),
-                    "tienda": nombre_tienda,
-                    "score": score,
-                }
-        if mejor:  # si la primera query ya dio resultado, no hace falta la variante sin números
+            lista.append({
+                "ean": ean,
+                "imagen_url": img_url,
+                "match_nombre": nombre_sku or prod.get('productName'),
+                "tienda": nombre_tienda,
+                "score": score,
+                **_datos_producto(prod, sku),
+            })
+        if alcanza(lista):  # si la primera query ya dio resultado, no hace falta la variante sin números
             break
-    return mejor
+    return lista
+
+
+def _buscar_en_tienda(nombre_tienda, dominio, queries, nombre_limpio, tamano_query, modo):
+    """Busca en una tienda VTEX y devuelve su mejor candidato para el modo pedido (o None)."""
+    def utiles(lista):
+        return [c for c in lista if _cumple_modo(c["ean"], c["imagen_url"], modo)]
+    lista = _evaluar_tienda(nombre_tienda, dominio, queries, nombre_limpio, tamano_query,
+                            SCORE_MINIMO, lambda l: bool(utiles(l)))
+    candidatos = utiles(lista)
+    return max(candidatos, key=lambda c: c["score"]) if candidatos else None
+
+
+def _queries_vtex(nombre_limpio):
+    # Variante sin números para búsquedas donde el gramaje exacto bloquea resultados
+    query_sin_numeros = re.sub(r'\b\d+(?:[.,]\d+)?\s*(?:' + _UNIDADES + r')?\b', '', nombre_limpio)
+    query_sin_numeros = re.sub(r'\s+', ' ', query_sin_numeros).strip()
+    queries = [nombre_limpio]
+    if query_sin_numeros and query_sin_numeros != nombre_limpio and len(query_sin_numeros.split()) >= 2:
+        queries.append(query_sin_numeros)
+    return queries
 
 
 def buscar_en_vtex(nombre_limpio, tamano_query=None, modo="ambos"):
@@ -384,14 +455,7 @@ def buscar_en_vtex(nombre_limpio, tamano_query=None, modo="ambos"):
     Busca en todas las tiendas VTEX en paralelo y devuelve el mejor resultado:
     dict con ean, imagen_url, match_nombre, marca, tienda y score (o None).
     """
-    # Variante sin números para búsquedas donde el gramaje exacto bloquea resultados
-    query_sin_numeros = re.sub(r'\b\d+(?:[.,]\d+)?\s*(?:' + _UNIDADES + r')?\b', '', nombre_limpio)
-    query_sin_numeros = re.sub(r'\s+', ' ', query_sin_numeros).strip()
-
-    queries = [nombre_limpio]
-    if query_sin_numeros and query_sin_numeros != nombre_limpio and len(query_sin_numeros.split()) >= 2:
-        queries.append(query_sin_numeros)
-
+    queries = _queries_vtex(nombre_limpio)
     futuros = [
         _pool_tiendas.submit(_buscar_en_tienda, nt, dom, queries, nombre_limpio, tamano_query, modo)
         for nt, dom in TIENDAS_VTEX
@@ -422,9 +486,9 @@ def _buscar_ean_en_tienda(nombre_tienda, dominio, ean):
                         "ean": ean,
                         "imagen_url": img_url,
                         "match_nombre": sku.get('nameComplete') or prod.get('productName'),
-                        "marca": prod.get('brand'),
                         "tienda": nombre_tienda,
                         "score": 100,
+                        **_datos_producto(prod, sku),
                     }
     except Exception:
         pass
@@ -439,6 +503,62 @@ def buscar_por_ean_vtex(ean):
         if res:
             return res
     return None
+
+
+SCORE_MINIMO_CANDIDATAS = 45  # más permisivo que la búsqueda automática: es una persona la que elige
+
+
+def buscar_candidatas(texto, ean=None, incluir_web=True, max_vtex=8, max_web=4):
+    """
+    Opciones para la pantalla de revisión: productos parecidos de todas las tiendas VTEX
+    (con su EAN, foto y datos) más fotos de la web. Devuelve una lista de dicts, de más a menos probable.
+    """
+    texto = str(texto or "").strip()
+    ean = normalizar_ean_celda(ean) or (texto if re.fullmatch(r'\d{8,14}', texto) else None)
+    nombre_limpio = limpiar_nombre_producto(texto) if texto and not texto.isdigit() else ""
+    tamano = extraer_tamano(texto) if nombre_limpio else None
+    candidatas = []
+
+    futuros = []
+    if nombre_limpio:
+        queries = _queries_vtex(nombre_limpio)
+        futuros = [
+            _pool_tiendas.submit(_evaluar_tienda, nt, dom, queries, nombre_limpio, tamano,
+                                 SCORE_MINIMO_CANDIDATAS, lambda l: any(c["imagen_url"] for c in l), 8)
+            for nt, dom in TIENDAS_VTEX
+        ]
+
+    # Se busca por EAN en este hilo (no en el pool) mientras corren las búsquedas por nombre:
+    # buscar_por_ean_vtex ya usa el pool y esperarlo desde adentro podría trabarlo.
+    r = buscar_por_ean_vtex(ean) if ean else None
+    if r:
+        candidatas.append({**r, "fuente": f"VTEX ({r['tienda']}) por EAN"})
+    vtex = []
+    for f in futuros:
+        con_foto = sorted((c for c in f.result() if c["imagen_url"]), key=lambda c: -c["score"])
+        vtex += [{**c, "fuente": f"VTEX ({c['tienda']})"} for c in con_foto[:2]]
+    vtex.sort(key=lambda c: (-c["score"], PRIORIDAD_TIENDA.get(c["tienda"], 99)))
+
+    vistos = {c["ean"] or c["imagen_url"] for c in candidatas}
+    for c in vtex:
+        clave = c["ean"] or c["imagen_url"]
+        if clave in vistos:
+            continue
+        vistos.add(clave)
+        candidatas.append(c)
+        if len(candidatas) >= max_vtex:
+            break
+
+    if incluir_web and (nombre_limpio or ean):
+        _, imagenes = buscar_en_duckduckgo(nombre_limpio or ean, buscar_ean=False, buscar_imagen=True,
+                                           ean_conocido=ean if not nombre_limpio else None)
+        for url in imagenes[:max_web]:
+            if url not in vistos:
+                vistos.add(url)
+                candidatas.append({"ean": None, "imagen_url": url, "match_nombre": None, "tienda": None,
+                                   "score": None, "fuente": "DuckDuckGo", "categoria": None,
+                                   "contenido": None, "descripcion": None, "link": None, "marca": None})
+    return candidatas
 
 
 # =============================================================================
@@ -796,6 +916,7 @@ def procesar_un_producto(
 
     ean = ean_conocido
     img_url = match_nom = marca = score = None
+    extra = {}  # categoría, contenido neto, descripción y link del producto en la tienda
     fuente_ean = "Dato de entrada" if ean_conocido else None
     fuente_img = None
     validacion_ia = None
@@ -834,6 +955,7 @@ def procesar_un_producto(
         res = buscar_por_ean_vtex(ean_conocido)
         if res:
             match_nom, marca, score = res["match_nombre"], res["marca"], 100
+            extra = res
             candidatos_vtex.append((res["imagen_url"], f"VTEX ({res['tienda']}) por EAN", False, res["match_nombre"]))
 
     # 2. Búsqueda por nombre en VTEX
@@ -847,6 +969,7 @@ def procesar_un_producto(
         res = buscar_en_vtex(nombre_limpio, tamano, modo_vtex)
         if res:
             match_nom, marca, score = res["match_nombre"], res["marca"], res["score"]
+            extra = res
             fuente = f"VTEX ({res['tienda']})"
             if falta_ean and res["ean"]:
                 ean, fuente_ean = res["ean"], fuente
@@ -941,6 +1064,10 @@ def procesar_un_producto(
         "Fuente_Imagen": fuente_img,
         "Score_Match": score,
         "Validacion_IA": validacion_ia,
+        "Categoria": extra.get("categoria"),
+        "Contenido_Neto": extra.get("contenido") or formatear_contenido(nombre_original),
+        "Descripcion": extra.get("descripcion"),
+        "Link_Producto": extra.get("link"),
         "Estado": estado,
         "Revisar": "; ".join(motivos) if motivos else None,
     }
@@ -1075,6 +1202,87 @@ def guardar_excel_con_miniaturas(df, ruta, lado=80, on_progreso=None):
     return sum(1 for o in origenes if miniaturas.get(o))
 
 
+def preparar_foto_publicar(datos, lado=1000, margen=0.06):
+    """
+    Foto lista para publicar: recorta el borde blanco, centra el producto en un cuadrado
+    de lado x lado con fondo blanco y margen parejo. Recibe bytes de imagen y devuelve bytes JPG (o None).
+    """
+    from io import BytesIO
+    from PIL import Image, ImageChops
+    try:
+        img = Image.open(BytesIO(datos))
+        img.load()
+        if img.mode in ("RGBA", "LA", "P"):
+            img = img.convert("RGBA")
+            fondo = Image.new("RGB", img.size, (255, 255, 255))
+            fondo.paste(img, mask=img.split()[-1])
+            img = fondo
+        else:
+            img = img.convert("RGB")
+        # Caja con todo lo que no es (casi) blanco
+        diferencia = ImageChops.difference(img, Image.new("RGB", img.size, (255, 255, 255))).convert("L")
+        caja = diferencia.point(lambda v: 255 if v > 15 else 0).getbbox()
+        if caja:
+            img = img.crop(caja)
+        util = lado * (1 - 2 * margen)
+        escala = min(util / img.width, util / img.height, 2.5)  # no agrandar más de 2,5x las fotos chicas
+        img = img.resize((max(1, round(img.width * escala)), max(1, round(img.height * escala))), Image.LANCZOS)
+        lienzo = Image.new("RGB", (lado, lado), (255, 255, 255))
+        lienzo.paste(img, ((lado - img.width) // 2, (lado - img.height) // 2))
+        salida = BytesIO()
+        lienzo.save(salida, format="JPEG", quality=90, optimize=True)
+        return salida.getvalue()
+    except Exception:
+        return None
+
+
+def exportar_fotos_publicar(df, carpeta, columna_nombre=None, lado=1000, on_progreso=None):
+    """
+    Genera en `carpeta` una foto lista para publicar por producto (EAN.jpg, o el nombre si no hay EAN).
+    Usa la imagen ya descargada si existe; si no, la baja de Imagen_URL. Devuelve cuántas fotos generó.
+    """
+    os.makedirs(carpeta, exist_ok=True)
+    trabajos = {}
+    for _, fila in df.iterrows():
+        url = fila.get("Imagen_URL")
+        if not isinstance(url, str) or not url.strip():
+            continue
+        ean = normalizar_ean_celda(fila.get("EAN"))
+        nombre = ean or nombre_archivo_seguro(str(fila.get(columna_nombre) or "") if columna_nombre else url)
+        if nombre in trabajos:
+            continue
+        local = fila.get("Imagen_Local")
+        trabajos[nombre] = local if isinstance(local, str) and os.path.isfile(local) else url
+
+    def procesar(item):
+        nombre, origen = item
+        try:
+            if os.path.isfile(origen):
+                with open(origen, "rb") as f:
+                    datos = f.read()
+            else:
+                r = session.get(origen, timeout=12)
+                if r.status_code != 200 or not (r.headers.get("Content-Type") or "").lower().startswith("image/"):
+                    return False
+                datos = r.content
+            jpg = preparar_foto_publicar(datos, lado)
+            if not jpg:
+                return False
+            with open(os.path.join(carpeta, f"{nombre}.jpg"), "wb") as f:
+                f.write(jpg)
+            return True
+        except Exception:
+            return False
+
+    hechas = 0
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for i, ok in enumerate(pool.map(procesar, trabajos.items()), 1):
+            hechas += ok
+            if on_progreso:
+                on_progreso(i, len(trabajos))
+    return hechas
+
+
 def _fila_pendiente(row, modo, reintentar):
     """Decide si una fila hay que procesarla (para reanudar sin repetir trabajo)."""
     estado = row.get("Estado")
@@ -1192,6 +1400,7 @@ def procesar_archivo(
     reintentar=False,
     validar_ia=None,
     miniaturas=False,
+    fotos_publicar=False,
 ):
     """Procesa un Excel/CSV con guardado incremental y reanudación automática."""
     if not os.path.exists(archivo_entrada):
@@ -1272,6 +1481,12 @@ def procesar_archivo(
         n = guardar_excel_con_miniaturas(df, archivo_salida)
         print(f"[INFO] {n} miniaturas agregadas.", flush=True)
 
+    if fotos_publicar:
+        carpeta_pub = os.path.join(carpeta_imagenes, "publicar")
+        print(f"[INFO] Generando fotos listas para publicar (1000x1000) en '{carpeta_pub}'...", flush=True)
+        n = exportar_fotos_publicar(df, carpeta_pub, columna_producto)
+        print(f"[INFO] {n} fotos generadas.", flush=True)
+
     print("-" * 75, flush=True)
     print("[FINALIZADO] PROCESO COMPLETADO", flush=True)
     print(f"Tiempo total: {round(time.time() - t_inicio, 1)} segundos", flush=True)
@@ -1314,6 +1529,9 @@ if __name__ == "__main__":
                              "DuckDuckGo/Google, 'todas' = también las de los catálogos")
     parser.add_argument("--miniaturas", action="store_true",
                         help="Agregar al Excel de salida una columna con la miniatura de cada imagen")
+    parser.add_argument("--fotos-publicar", action="store_true",
+                        help="Generar fotos listas para publicar (1000x1000, fondo blanco, nombradas por EAN) "
+                             "en <images-dir>/publicar")
     parser.add_argument("--reintentar", action="store_true",
                         help="Volver a buscar las filas que en una corrida previa quedaron incompletas")
 
@@ -1346,4 +1564,5 @@ if __name__ == "__main__":
         reintentar=args.reintentar,
         validar_ia=args.validar_ia,
         miniaturas=args.miniaturas,
+        fotos_publicar=args.fotos_publicar,
     )
