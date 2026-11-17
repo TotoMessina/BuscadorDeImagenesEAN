@@ -2,3 +2,4 @@
 requests>=2.31
 rapidfuzz>=3.0
 ddgs>=9.0
+anthropic>=2.9  # validación de imágenes con IA (opcional, requiere ANTHROPIC_API_KEY)

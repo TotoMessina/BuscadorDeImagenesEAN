@@ -32,6 +32,7 @@ Uso rápido:
 import os
 import re
 import sys
+import json
 import time
 import argparse
 import unicodedata
@@ -49,8 +50,9 @@ except ImportError:  # En Vercel no se instala pandas: solo hace falta para proc
 
 # Configurar salida de consola segura para Windows
 try:
-    if hasattr(sys.stdout, 'reconfigure'):
-        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    for _flujo in (sys.stdout, sys.stderr):
+        if hasattr(_flujo, 'reconfigure'):
+            _flujo.reconfigure(encoding='utf-8', errors='replace')
 except Exception:
     pass
 
@@ -109,18 +111,29 @@ TIENDAS_VTEX = [
     ("Farmacity", "www.farmacity.com"),
     ("Disco", "www.disco.com.ar"),
     ("Vea", "www.vea.com.ar"),
+    # Supermercados regionales / mayoristas
+    ("Josimar", "www.josimar.com.ar"),
+    ("Cordiez", "www.cordiez.com.ar"),
+    ("Toledo", "www.toledodigital.com.ar"),
+    # Farmacias y perfumerías
+    ("Farmaonline", "www.farmaonline.com"),
+    ("Farmacias del Pueblo", "www.farmaciasdelpueblo.com.ar"),
+    ("Simplicity", "www.simplicity.com.ar"),
+    ("Get The Look", "www.getthelook.com.ar"),
+    ("Pigmento", "www.perfumeriaspigmento.com.ar"),
+    ("Juleriaque", "www.juleriaque.com.ar"),
 ]
 PRIORIDAD_TIENDA = {nombre: i for i, (nombre, _) in enumerate(TIENDAS_VTEX)}
 
 # Columnas de resultado que agrega el script
 COLUMNAS_RESULTADO = [
     "EAN", "EAN_Valido", "Imagen_URL", "Imagen_Local", "Match_Nombre", "Marca",
-    "Fuente_EAN", "Fuente_Imagen", "Score_Match", "Estado", "Revisar",
+    "Fuente_EAN", "Fuente_Imagen", "Score_Match", "Validacion_IA", "Estado", "Revisar",
 ]
 
 # Sesión HTTP con reutilización de conexiones TLS (compartida entre hilos)
 session = requests.Session()
-_adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=1)
+_adapter = HTTPAdapter(pool_connections=40, pool_maxsize=40, max_retries=1)
 session.mount("https://", _adapter)
 session.mount("http://", _adapter)
 session.headers.update({
@@ -464,21 +477,28 @@ def _importar_ddgs():
             return None
 
 
+MAX_CANDIDATOS_WEB = 5
+
+
 def buscar_en_duckduckgo(nombre_limpio, buscar_ean=True, buscar_imagen=True, ean_conocido=None):
-    """Fallback gratuito sin API Key usando DuckDuckGo. Devuelve (ean, img_url)."""
+    """
+    Fallback gratuito sin API Key usando DuckDuckGo.
+    Devuelve (ean, [urls de imágenes candidatas, de mejor a peor]).
+    """
     DDGS = _importar_ddgs()
     if DDGS is None:
-        return None, None
+        return None, []
 
-    img_url = None
+    imagenes = []
     ean_encontrado = None
     try:
         with DDGS() as dd:
             if buscar_imagen:
                 base = ean_conocido or nombre_limpio
-                for r in dd.images(f"{base} {QUERY_IMG_SUFIJO}", max_results=8):
+                for r in dd.images(f"{base} {QUERY_IMG_SUFIJO}", max_results=10):
                     if es_imagen_limpia_sin_marca_de_agua(r.get('image'), r.get('title', '')):
-                        img_url = r.get('image')
+                        imagenes.append(r.get('image'))
+                    if len(imagenes) >= MAX_CANDIDATOS_WEB:
                         break
 
             if buscar_ean:
@@ -488,17 +508,20 @@ def buscar_en_duckduckgo(nombre_limpio, buscar_ean=True, buscar_imagen=True, ean
                 ean_encontrado = eans[0] if eans else None
     except Exception:
         pass
-    return ean_encontrado, img_url
+    return ean_encontrado, imagenes
 
 
 def buscar_en_serper(nombre_limpio, api_key, buscar_ean=True, buscar_imagen=True, ean_conocido=None):
-    """Fallback usando Google Search + Google Images a través de Serper.dev. Devuelve (ean, img_url)."""
+    """
+    Fallback usando Google Search + Google Images a través de Serper.dev.
+    Devuelve (ean, [urls de imágenes candidatas]).
+    """
     if not api_key or not api_key.strip():
-        return None, None
+        return None, []
 
     headers_serper = {"X-API-KEY": api_key.strip(), "Content-Type": "application/json"}
     ean_encontrado = None
-    img_encontrada = None
+    imagenes = []
 
     if buscar_ean:
         try:
@@ -523,12 +546,169 @@ def buscar_en_serper(nombre_limpio, api_key, buscar_ean=True, buscar_imagen=True
             ).json()
             for item in res.get("images", []):
                 if es_imagen_limpia_sin_marca_de_agua(item.get("imageUrl"), item.get("title", "")):
-                    img_encontrada = item.get("imageUrl")
+                    imagenes.append(item.get("imageUrl"))
+                if len(imagenes) >= MAX_CANDIDATOS_WEB:
                     break
         except Exception:
             pass
 
-    return ean_encontrado, img_encontrada
+    return ean_encontrado, imagenes
+
+
+# =============================================================================
+# Validación de imágenes con IA (Claude con visión)
+# =============================================================================
+#
+# Opcional: se activa definiendo la variable de entorno ANTHROPIC_API_KEY.
+# Revisa cada foto candidata y descarta las que muestran otro producto, tienen
+# marcas de agua, o no sirven como foto de catálogo (banners, collages, etc.).
+#
+# Modelo: por defecto claude-opus-5-5. Se puede cambiar con la variable
+# CLAUDE_MODELO_VISION (por ejemplo claude-haiku-5-5, mucho más barato).
+
+MODELO_VISION = os.environ.get("CLAUDE_MODELO_VISION", "claude-opus-5-5").strip()
+VALIDAR_IA_OPCIONES = ("web", "todas")  # "web": solo fotos de DuckDuckGo/Google; "todas": también las de VTEX
+MAX_VALIDACIONES_POR_PRODUCTO = 3
+_TAMANO_MAXIMO_IMAGEN_IA = 4_500_000  # la API acepta hasta 5 MB por imagen
+_TIPOS_IMAGEN_IA = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+# Modelos que aceptan el reintento automático del lado del servidor ante un rechazo de seguridad
+_MODELOS_CON_FALLBACK = {"claude-fable-5-2", "claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5"}
+
+ESQUEMA_VALIDACION = {
+    "type": "object",
+    "properties": {
+        "coincide_producto": {"type": "boolean"},
+        "tiene_marca_de_agua": {"type": "boolean"},
+        "es_foto_de_producto": {"type": "boolean"},
+        "motivo": {"type": "string"},
+    },
+    "required": ["coincide_producto", "tiene_marca_de_agua", "es_foto_de_producto", "motivo"],
+    "additionalProperties": False,
+}
+
+PROMPT_VALIDACION = """Sos el control de calidad de un catálogo de productos de consumo masivo de Argentina.
+Te paso una foto candidata y el producto que se está buscando.
+
+Producto buscado: "{producto}"{referencia}
+
+Evaluá la foto:
+1. coincide_producto: ¿muestra este mismo producto? Tiene que ser la misma marca y la misma variante \
+(sabor, fragancia, tipo). Si el tamaño o gramaje se ve en el envase y es claramente distinto, no coincide. \
+Si la foto no permite confirmar algún detalle pero la marca y el tipo de producto son los mismos, contalo como que coincide.
+2. tiene_marca_de_agua: ¿hay marcas de agua, logos o sellos de bancos de imágenes, tiendas o vendedores \
+superpuestos sobre la foto? Los logos y textos impresos en el propio envase NO cuentan.
+3. es_foto_de_producto: ¿sirve como foto de catálogo? (el producto se ve entero y es el protagonista). \
+No sirve si es un banner con precios o texto promocional, un collage de varios productos distintos, \
+una persona usando el producto, un ícono o una imagen rota.
+
+En "motivo" explicá tu decisión en una frase corta en español."""
+
+_cliente_ia = None
+_ia_deshabilitada = None  # se completa con el motivo si la API devuelve un error que no se arregla reintentando
+_cache_validacion = {}
+
+
+def ia_disponible():
+    """True si está configurada la API key de Anthropic y el SDK está instalado."""
+    if _ia_deshabilitada:
+        return False
+    if not (os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")):
+        return False
+    try:
+        import anthropic  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _obtener_cliente_ia():
+    global _cliente_ia
+    if _cliente_ia is None:
+        import anthropic
+        _cliente_ia = anthropic.Anthropic(timeout=45.0, max_retries=2)
+    return _cliente_ia
+
+
+def _descargar_para_ia(url):
+    """Descarga la imagen y la devuelve como (media_type, base64), o None si no sirve."""
+    import base64
+    try:
+        r = session.get(url, stream=True, timeout=12)
+        tipo = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if tipo == "image/jpg":
+            tipo = "image/jpeg"
+        if r.status_code != 200 or tipo not in _TIPOS_IMAGEN_IA:
+            return None
+        datos = bytearray()
+        for chunk in r.iter_content(chunk_size=65536):
+            datos.extend(chunk)
+            if len(datos) > _TAMANO_MAXIMO_IMAGEN_IA:
+                return None
+        if len(datos) < 1024:
+            return None
+        return tipo, base64.standard_b64encode(bytes(datos)).decode("ascii")
+    except Exception:
+        return None
+
+
+def validar_imagen_ia(url, producto, referencia=None):
+    """
+    Pide a Claude que revise una foto candidata.
+    Devuelve {"aprobada": bool, "motivo": str} o None si no se pudo validar (sin IA, error de red, etc.).
+    """
+    global _ia_deshabilitada
+    if not ia_disponible():
+        return None
+    clave = (url, producto, referencia)
+    if clave in _cache_validacion:
+        return _cache_validacion[clave]
+
+    imagen = _descargar_para_ia(url)
+    if imagen is None:
+        resultado = {"aprobada": False, "motivo": "la imagen no se pudo descargar o el formato no es compatible"}
+        _cache_validacion[clave] = resultado
+        return resultado
+
+    import anthropic
+    texto_ref = f'\nNombre en el catálogo de la tienda: "{referencia}"' if referencia else ""
+    contenido = [
+        {"type": "image", "source": {"type": "base64", "media_type": imagen[0], "data": imagen[1]}},
+        {"type": "text", "text": PROMPT_VALIDACION.format(producto=producto, referencia=texto_ref)},
+    ]
+    parametros = dict(
+        model=MODELO_VISION,
+        max_tokens=2048,
+        output_config={"effort": "low", "format": {"type": "json_schema", "schema": ESQUEMA_VALIDACION}},
+        messages=[{"role": "user", "content": contenido}],
+    )
+    cliente = _obtener_cliente_ia()
+    try:
+        if MODELO_VISION in _MODELOS_CON_FALLBACK:
+            respuesta = cliente.beta.messages.create(
+                betas=["server-side-fallback-2026-07-01"], fallbacks="default", **parametros)
+        else:
+            respuesta = cliente.messages.create(**parametros)
+    except (anthropic.AuthenticationError, anthropic.PermissionDeniedError,
+            anthropic.NotFoundError, anthropic.BadRequestError) as e:
+        # Errores de configuración: no tiene sentido seguir intentando con cada producto
+        _ia_deshabilitada = f"{type(e).__name__}: {getattr(e, 'message', e)}"
+        print(f"[IA] Validación desactivada: {_ia_deshabilitada}", file=sys.stderr, flush=True)
+        return None
+    except (anthropic.RateLimitError, anthropic.APIStatusError, anthropic.APIConnectionError):
+        return None  # error temporal: queda "sin validar" y se puede reintentar más tarde
+
+    if respuesta.stop_reason != "end_turn":  # refusal, max_tokens, etc.
+        return None
+    texto = next((b.text for b in respuesta.content if b.type == "text"), "")
+    try:
+        datos = json.loads(texto)
+    except ValueError:
+        return None
+
+    aprobada = datos["coincide_producto"] and not datos["tiene_marca_de_agua"] and datos["es_foto_de_producto"]
+    resultado = {"aprobada": bool(aprobada), "motivo": str(datos.get("motivo", "")).strip()}
+    _cache_validacion[clave] = resultado
+    return resultado
 
 
 # =============================================================================
@@ -588,6 +768,7 @@ def procesar_un_producto(
     serper_key=None,
     carpeta_imagenes=None,
     solo_oficiales_vtex=False,
+    validar_ia=None,
 ):
     """
     Ejecuta el pipeline de búsqueda para un único producto.
@@ -596,9 +777,13 @@ def procesar_un_producto(
     ean_conocido: si ya se tiene el EAN (o el texto ingresado ES un EAN), se usa para
                   buscar la imagen exacta por código, que es mucho más preciso que por nombre.
     solo_oficiales_vtex: si es True, solo acepta imágenes de catálogos oficiales VTEX.
+    validar_ia: None (no validar) | 'web' (validar las fotos de DuckDuckGo/Google) |
+                'todas' (validar también las de VTEX). Requiere ANTHROPIC_API_KEY.
     """
     if modo not in MODOS:
         raise ValueError(f"modo debe ser uno de {MODOS}")
+    if validar_ia not in VALIDAR_IA_OPCIONES:
+        validar_ia = None
 
     nombre_original = str(nombre_original or "").strip()
     # Si lo que se ingresó es directamente un código, usarlo como EAN conocido
@@ -613,19 +798,49 @@ def procesar_un_producto(
     img_url = match_nom = marca = score = None
     fuente_ean = "Dato de entrada" if ean_conocido else None
     fuente_img = None
+    validacion_ia = None
+    rechazos_ia = []          # motivos de las fotos descartadas por la IA
+    vtex_rechazada = False    # la IA dijo que la foto de VTEX no es el producto (el EAN también puede estar mal)
+    validaciones = [0]
+    usar_ia = bool(validar_ia) and necesita_img and ia_disponible()
+
+    def elegir_imagen(candidatos):
+        """
+        Recorre las fotos candidatas [(url, fuente, es_web, referencia)] y devuelve la primera aceptada
+        como (url, fuente, estado_validacion), o None si ninguna sirve.
+        """
+        nonlocal vtex_rechazada
+        for url, fuente, es_web, referencia in candidatos:
+            requiere = usar_ia and (validar_ia == "todas" or es_web)
+            if not requiere:
+                return url, fuente, None
+            if validaciones[0] >= MAX_VALIDACIONES_POR_PRODUCTO:
+                return None
+            validaciones[0] += 1
+            v = validar_imagen_ia(url, nombre_original, referencia)
+            if v is None:
+                return url, fuente, "Sin validar (error de IA)"
+            if v["aprobada"]:
+                return url, fuente, "Aprobada"
+            rechazos_ia.append(f"{fuente}: {v['motivo']}")
+            if not es_web:
+                vtex_rechazada = True
+        return None
+
+    candidatos_vtex = []
 
     # 1. Si hay EAN conocido y se necesita imagen: búsqueda exacta por código
     if ean_conocido and necesita_img:
         res = buscar_por_ean_vtex(ean_conocido)
         if res:
-            img_url, match_nom, marca, score = res["imagen_url"], res["match_nombre"], res["marca"], 100
-            fuente_img = f"VTEX ({res['tienda']}) por EAN"
+            match_nom, marca, score = res["match_nombre"], res["marca"], 100
+            candidatos_vtex.append((res["imagen_url"], f"VTEX ({res['tienda']}) por EAN", False, res["match_nombre"]))
 
     # 2. Búsqueda por nombre en VTEX
     nombre_limpio = limpiar_nombre_producto(nombre_original) if not nombre_original.isdigit() else ""
     tamano = extraer_tamano(nombre_original) if nombre_limpio else None
     falta_ean = necesita_ean and not ean
-    falta_img = necesita_img and not img_url
+    falta_img = necesita_img and not candidatos_vtex
 
     if nombre_limpio and (falta_ean or falta_img):
         modo_vtex = "ambos" if (falta_ean and falta_img) else ("ean" if falta_ean else "imagen")
@@ -636,30 +851,50 @@ def procesar_un_producto(
             if falta_ean and res["ean"]:
                 ean, fuente_ean = res["ean"], fuente
             if falta_img and res["imagen_url"]:
-                img_url, fuente_img = res["imagen_url"], fuente
+                candidatos_vtex.append((res["imagen_url"], fuente, False, res["match_nombre"]))
+
+    if necesita_img and candidatos_vtex:
+        elegida = elegir_imagen(candidatos_vtex)
+        if elegida:
+            img_url, fuente_img, validacion_ia = elegida
 
     # 3. Fallbacks web para lo que siga faltando
     falta_ean = necesita_ean and not ean
     falta_img = necesita_img and not img_url and not solo_oficiales_vtex
     consulta_web = nombre_limpio or (ean_conocido or "")
+    candidatos_web = []
 
     if consulta_web and (falta_ean or falta_img) and serper_key:
-        ean_s, img_s = buscar_en_serper(consulta_web, serper_key, falta_ean and bool(nombre_limpio),
-                                        falta_img, ean_conocido)
+        ean_s, imgs_s = buscar_en_serper(consulta_web, serper_key, falta_ean and bool(nombre_limpio),
+                                         falta_img, ean_conocido)
         if falta_ean and ean_s:
             ean, fuente_ean = ean_s, "Google (Serper)"
-        if falta_img and img_s:
-            img_url, fuente_img = img_s, "Google (Serper)"
+        candidatos_web += [(u, "Google (Serper)", True, None) for u in imgs_s]
         falta_ean = necesita_ean and not ean
-        falta_img = falta_img and not img_url
+        if falta_img and candidatos_web:
+            elegida = elegir_imagen(candidatos_web)
+            if elegida:
+                img_url, fuente_img, validacion_ia = elegida
+            falta_img = not img_url and validaciones[0] < MAX_VALIDACIONES_POR_PRODUCTO
 
     if consulta_web and (falta_ean or falta_img):
-        ean_d, img_d = buscar_en_duckduckgo(consulta_web, falta_ean and bool(nombre_limpio),
-                                            falta_img, ean_conocido)
+        ean_d, imgs_d = buscar_en_duckduckgo(consulta_web, falta_ean and bool(nombre_limpio),
+                                             falta_img, ean_conocido)
         if falta_ean and ean_d:
             ean, fuente_ean = ean_d, "DuckDuckGo"
-        if falta_img and img_d:
-            img_url, fuente_img = img_d, "DuckDuckGo"
+        vistos = {c[0] for c in candidatos_web}
+        nuevos = [(u, "DuckDuckGo", True, None) for u in imgs_d if u not in vistos]
+        if falta_img and nuevos:
+            elegida = elegir_imagen(nuevos)
+            if elegida:
+                img_url, fuente_img, validacion_ia = elegida
+
+    if not img_url and rechazos_ia:
+        validacion_ia = "Rechazadas: " + " | ".join(rechazos_ia)
+    elif img_url and rechazos_ia:
+        validacion_ia = f"{validacion_ia} (antes se descartaron {len(rechazos_ia)})"
+    elif usar_ia is False and validar_ia and necesita_img and img_url:
+        validacion_ia = "Sin validar (IA no configurada)"
 
     # 4. Descarga local de la imagen
     ruta_local = None
@@ -686,8 +921,14 @@ def procesar_un_producto(
         motivos.append("EAN interno de tienda (empieza con 2)")
     if fuente_ean in ("DuckDuckGo", "Google (Serper)"):
         motivos.append("EAN tomado de la web")
-    if fuente_img in ("DuckDuckGo", "Google (Serper)"):
+    if fuente_img in ("DuckDuckGo", "Google (Serper)") and validacion_ia is None:
         motivos.append("imagen tomada de la web")
+    if validacion_ia and validacion_ia.startswith("Sin validar") and fuente_img in ("DuckDuckGo", "Google (Serper)"):
+        motivos.append("imagen de la web sin validar")
+    if vtex_rechazada:
+        motivos.append("la IA indicó que la foto del catálogo no coincide: revisar también el EAN")
+    if not img_url and rechazos_ia:
+        motivos.append("todas las fotos candidatas fueron descartadas por la IA")
 
     return {
         "EAN": ean,
@@ -699,6 +940,7 @@ def procesar_un_producto(
         "Fuente_EAN": fuente_ean,
         "Fuente_Imagen": fuente_img,
         "Score_Match": score,
+        "Validacion_IA": validacion_ia,
         "Estado": estado,
         "Revisar": "; ".join(motivos) if motivos else None,
     }
@@ -737,6 +979,102 @@ def guardar_tabla(df, ruta):
     os.replace(tmp, ruta)
 
 
+COLUMNA_MINIATURA = "Foto"
+
+
+def _miniatura_png(origen, lado):
+    """Genera una miniatura PNG (bytes) desde una ruta local o una URL. Devuelve (bytes, ancho, alto) o None."""
+    from io import BytesIO
+    from PIL import Image
+    try:
+        if origen and os.path.isfile(origen):
+            with open(origen, "rb") as f:
+                datos = f.read()
+        else:
+            r = session.get(origen, timeout=12)
+            tipo = (r.headers.get("Content-Type") or "").lower()
+            if r.status_code != 200 or not tipo.startswith("image/"):
+                return None
+            datos = r.content
+        img = Image.open(BytesIO(datos))
+        img.load()
+        if img.mode in ("RGBA", "LA", "P"):
+            fondo = Image.new("RGB", img.size, (255, 255, 255))
+            img = img.convert("RGBA")
+            fondo.paste(img, mask=img.split()[-1])
+            img = fondo
+        else:
+            img = img.convert("RGB")
+        img.thumbnail((lado, lado))
+        salida = BytesIO()
+        img.save(salida, format="PNG", optimize=True)
+        return salida.getvalue(), img.width, img.height
+    except Exception:
+        return None
+
+
+def guardar_excel_con_miniaturas(df, ruta, lado=80, on_progreso=None):
+    """
+    Guarda el Excel con una columna "Foto" al principio que muestra la miniatura de cada producto.
+    Usa la imagen descargada (Imagen_Local) si existe; si no, la baja de Imagen_URL.
+    """
+    if ruta.lower().endswith(".csv"):
+        return guardar_tabla(df, ruta)
+    from io import BytesIO
+    from openpyxl import load_workbook
+    from openpyxl.drawing.image import Image as ImagenExcel
+    from openpyxl.utils import get_column_letter
+
+    df = df.drop(columns=[COLUMNA_MINIATURA], errors="ignore")
+    guardar_tabla(df, ruta)
+
+    # Una miniatura por imagen distinta, descargadas en paralelo
+    origenes = {}
+    for pos, (_, fila) in enumerate(df.iterrows()):
+        local = fila.get("Imagen_Local")
+        url = fila.get("Imagen_URL")
+        origen = local if isinstance(local, str) and os.path.isfile(local) else url
+        if isinstance(origen, str) and origen.strip():
+            origenes.setdefault(origen, []).append(pos)
+
+    miniaturas = {}
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futuros = {pool.submit(_miniatura_png, o, lado * 2): o for o in origenes}  # x2 para que se vea nítida
+        for i, futuro in enumerate(futuros, 1):
+            miniaturas[futuros[futuro]] = futuro.result()
+            if on_progreso:
+                on_progreso(i, len(futuros))
+
+    libro = load_workbook(ruta)
+    hoja = libro.active
+    hoja.insert_cols(1)
+    hoja.cell(row=1, column=1, value=COLUMNA_MINIATURA)
+    hoja.column_dimensions["A"].width = lado / 6.5
+    for col in range(2, hoja.max_column + 1):  # al insertar la columna, openpyxl no corre los anchos
+        hoja.column_dimensions[get_column_letter(col)].width = 18
+    alto_fila_pt = lado * 0.75 + 4
+
+    for origen, posiciones in origenes.items():
+        mini = miniaturas.get(origen)
+        if not mini:
+            continue
+        datos, ancho, alto = mini
+        escala = lado / max(ancho, alto)
+        for pos in posiciones:
+            imagen = ImagenExcel(BytesIO(datos))
+            imagen.width, imagen.height = int(ancho * escala), int(alto * escala)
+            fila_excel = pos + 2
+            hoja.add_image(imagen, f"A{fila_excel}")
+            hoja.row_dimensions[fila_excel].height = alto_fila_pt
+
+    hoja.freeze_panes = "B2"
+    base, ext = os.path.splitext(ruta)
+    tmp = f"{base}.tmp{ext}"
+    libro.save(tmp)
+    os.replace(tmp, ruta)
+    return sum(1 for o in origenes if miniaturas.get(o))
+
+
 def _fila_pendiente(row, modo, reintentar):
     """Decide si una fila hay que procesarla (para reanudar sin repetir trabajo)."""
     estado = row.get("Estado")
@@ -757,6 +1095,7 @@ def procesar_dataframe(
     serper_key=None,
     carpeta_imagenes=None,
     solo_oficiales_vtex=False,
+    validar_ia=None,
     max_filas=None,
     reintentar=False,
     on_progreso=None,
@@ -769,6 +1108,7 @@ def procesar_dataframe(
     on_guardar(df) se llama cada 10 filas para guardado incremental.
     Devuelve (df, estadisticas).
     """
+    df = df.drop(columns=[COLUMNA_MINIATURA], errors="ignore")
     for c in COLUMNAS_RESULTADO:
         if c not in df.columns:
             df[c] = None
@@ -811,6 +1151,7 @@ def procesar_dataframe(
                     serper_key=serper_key,
                     carpeta_imagenes=carpeta_imagenes,
                     solo_oficiales_vtex=solo_oficiales_vtex,
+                    validar_ia=validar_ia,
                 )
                 cache[clave] = res
                 time.sleep(pausa)
@@ -849,6 +1190,8 @@ def procesar_archivo(
     max_filas=None,
     solo_oficiales_vtex=False,
     reintentar=False,
+    validar_ia=None,
+    miniaturas=False,
 ):
     """Procesa un Excel/CSV con guardado incremental y reanudación automática."""
     if not os.path.exists(archivo_entrada):
@@ -875,6 +1218,13 @@ def procesar_archivo(
         print("[INFO] Filtro estricto: solo imágenes de catálogos oficiales VTEX", flush=True)
     if descargar_fotos:
         print(f"[INFO] Descarga de imágenes en carpeta: '{carpeta_imagenes}'", flush=True)
+    if validar_ia:
+        if ia_disponible():
+            alcance = "todas las imágenes" if validar_ia == "todas" else "las imágenes de la web"
+            print(f"[INFO] Validación con IA ({MODELO_VISION}) de {alcance}", flush=True)
+        else:
+            print("[AVISO] --validar-ia pedido pero falta ANTHROPIC_API_KEY o el paquete 'anthropic'. "
+                  "Se sigue sin validar.", flush=True)
 
     # Reanudar desde un archivo de salida previo
     if os.path.exists(archivo_salida):
@@ -909,13 +1259,18 @@ def procesar_archivo(
             df, columna_producto, modo=modo, columna_ean=columna_ean,
             serper_key=serper_key,
             carpeta_imagenes=carpeta_imagenes if descargar_fotos else None,
-            solo_oficiales_vtex=solo_oficiales_vtex, max_filas=max_filas,
+            solo_oficiales_vtex=solo_oficiales_vtex, validar_ia=validar_ia, max_filas=max_filas,
             reintentar=reintentar, on_progreso=progreso,
             on_guardar=lambda d: guardar_tabla(d, archivo_salida),
         )
     except KeyboardInterrupt:
         print("\n[PAUSA] Interrumpido. El avance quedó guardado; volvé a ejecutar para continuar.", flush=True)
         return
+
+    if miniaturas and not archivo_salida.lower().endswith(".csv"):
+        print("[INFO] Agregando miniaturas de las imágenes al Excel...", flush=True)
+        n = guardar_excel_con_miniaturas(df, archivo_salida)
+        print(f"[INFO] {n} miniaturas agregadas.", flush=True)
 
     print("-" * 75, flush=True)
     print("[FINALIZADO] PROCESO COMPLETADO", flush=True)
@@ -954,6 +1309,11 @@ if __name__ == "__main__":
     parser.add_argument("--limit", type=int, default=None, help="Límite de filas a procesar (para pruebas)")
     parser.add_argument("--solo-oficiales", action="store_true",
                         help="Solo aceptar imágenes de catálogos oficiales VTEX (0 marcas de agua)")
+    parser.add_argument("--validar-ia", choices=VALIDAR_IA_OPCIONES, default=None,
+                        help="Validar fotos con IA (requiere ANTHROPIC_API_KEY): 'web' = solo las de "
+                             "DuckDuckGo/Google, 'todas' = también las de los catálogos")
+    parser.add_argument("--miniaturas", action="store_true",
+                        help="Agregar al Excel de salida una columna con la miniatura de cada imagen")
     parser.add_argument("--reintentar", action="store_true",
                         help="Volver a buscar las filas que en una corrida previa quedaron incompletas")
 
@@ -966,6 +1326,7 @@ if __name__ == "__main__":
             serper_key=args.serper_key,
             carpeta_imagenes=args.images_dir if args.download_images else None,
             solo_oficiales_vtex=args.solo_oficiales,
+            validar_ia=args.validar_ia,
         )
         imprimir_resultado(entrada, res)
         sys.exit(0)
@@ -983,4 +1344,6 @@ if __name__ == "__main__":
         max_filas=args.limit,
         solo_oficiales_vtex=args.solo_oficiales,
         reintentar=args.reintentar,
+        validar_ia=args.validar_ia,
+        miniaturas=args.miniaturas,
     )

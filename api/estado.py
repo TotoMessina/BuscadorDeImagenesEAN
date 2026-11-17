@@ -1,6 +1,6 @@
 """
 GET /api/estado
-  -> {"requiere_clave": bool}  (la página lo usa para saber si tiene que pedir la clave)
+  -> {"requiere_clave", "ia_disponible", "modelo_ia", "tiendas"}  (configuración para la página)
 GET /api/estado?diagnostico=1
   -> prueba si cada tienda VTEX y DuckDuckGo responden desde el servidor de Vercel.
 """
@@ -13,7 +13,7 @@ from urllib.parse import urlparse, parse_qs
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _comun import autorizado, clave_requerida, responder_json  # noqa: E402
-from buscador_productos import TIENDAS_VTEX, session, _pool_tiendas, _importar_ddgs  # noqa: E402
+from buscador_productos import TIENDAS_VTEX, session, _pool_tiendas, _importar_ddgs, ia_disponible, MODELO_VISION  # noqa: E402
 
 EAN_PRUEBA = "7790895000997"  # Coca-Cola 2,25 L, presente en casi todos los supermercados
 
@@ -52,7 +52,12 @@ class handler(BaseHTTPRequestHandler):
     def do_GET(self):
         params = parse_qs(urlparse(self.path).query)
         if "diagnostico" not in params:
-            return responder_json(self, {"requiere_clave": bool(clave_requerida())})
+            return responder_json(self, {
+                "requiere_clave": bool(clave_requerida()),
+                "ia_disponible": ia_disponible(),
+                "modelo_ia": MODELO_VISION,
+                "tiendas": [n for n, _ in TIENDAS_VTEX],
+            })
 
         if not autorizado(self):
             return responder_json(self, {"error": "Clave de acceso incorrecta"}, 401)
@@ -62,5 +67,7 @@ class handler(BaseHTTPRequestHandler):
         return responder_json(self, {
             "region": os.environ.get("VERCEL_REGION", "local"),
             "serper_configurado": bool(os.environ.get("SERPER_API_KEY")),
+            "ia_disponible": ia_disponible(),
+            "modelo_ia": MODELO_VISION,
             "resultados": resultados,
         })

@@ -7,6 +7,7 @@
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔍</text></svg>">
 <script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/exceljs/4.4.0/exceljs.min.js"></script>
 <style>
   :root {
     --bg: #f5f6f8; --panel: #ffffff; --text: #1d2330; --muted: #5d6676; --border: #dde1e8;
@@ -100,7 +101,7 @@
   <header>
     <div>
       <h1>🔍 Buscador de EAN e Imágenes</h1>
-      <p class="sub">Carrefour · Jumbo · ChangoMás · Día · Farmacity · Disco · Vea, con fallback web y filtro anti-marcas de agua.</p>
+      <p class="sub" id="subtitulo">Supermercados, farmacias y perfumerías de Argentina, con fallback web y filtro anti-marcas de agua.</p>
     </div>
     <button class="btn" id="btnDiag" title="Comprueba qué tiendas responden desde el servidor">🩺 Estado de las fuentes</button>
   </header>
@@ -121,6 +122,11 @@
       <div class="seg" data-grupo="modoInd"></div>
       <label class="check"><input type="checkbox" id="estrictoInd">
         <span>Solo catálogos oficiales<small>Sin fotos de la web (0% marcas de agua)</small></span></label>
+      <div class="bloque-ia">
+        <label class="campo" for="iaInd">🤖 Validar fotos con IA</label>
+        <select id="iaInd" class="select-ia"></select>
+        <small class="muted nota-ia"></small>
+      </div>
       <button class="btn primario ancho" id="btnBuscar">Buscar</button>
     </form>
     <div class="panel" id="resInd"><p class="muted">Escribí un producto o un EAN y presioná Buscar.</p></div>
@@ -143,6 +149,13 @@
         <div class="seg" data-grupo="modoLote"></div>
         <label class="check"><input type="checkbox" id="estrictoLote">
           <span>Solo catálogos oficiales<small>Sin fotos de la web (0% marcas de agua)</small></span></label>
+        <div class="bloque-ia">
+          <label class="campo" for="iaLote">🤖 Validar fotos con IA</label>
+          <select id="iaLote" class="select-ia"></select>
+          <small class="muted nota-ia"></small>
+        </div>
+        <label class="check"><input type="checkbox" id="miniaturas" checked>
+          <span>Miniaturas en el Excel<small>Agrega una columna con la foto de cada producto</small></span></label>
         <label class="campo" for="limite">Límite de filas (0 = todas)</label>
         <input type="number" id="limite" value="0" min="0">
         <button class="btn primario ancho" id="btnIniciar">🚀 Comenzar búsqueda</button>
@@ -165,7 +178,7 @@
         </div>
         <div class="filtros" id="filtros"></div>
         <div class="tabla-wrap"><table><thead><tr>
-          <th>#</th><th>Foto</th><th>Producto</th><th>Estado</th><th>EAN</th><th>Score</th><th>Fuente</th><th>Coincidencia</th><th>Revisar</th>
+          <th>#</th><th>Foto</th><th>Producto</th><th>Estado</th><th>EAN</th><th>Score</th><th>Fuente</th><th>IA</th><th>Coincidencia</th><th>Revisar</th>
         </tr></thead><tbody id="tbody"></tbody></table></div>
         <p class="muted" id="notaTabla"></p>
       </div>
@@ -191,7 +204,16 @@ const MODOS = [["ambos", "EAN + Imagen"], ["ean", "Solo EAN"], ["imagen", "Solo 
 const COLS_NOMBRE = ["nombre", "producto", "descripcion", "descripción", "title", "name", "articulo", "artículo"];
 const COLS_EAN = ["ean", "ean13", "codigo_barras", "codigo de barras", "código de barras", "gtin", "upc", "cod barras"];
 const COLS_RESULTADO = ["EAN", "EAN_Valido", "Imagen_URL", "Match_Nombre", "Marca", "Fuente_EAN",
-                        "Fuente_Imagen", "Score_Match", "Estado", "Revisar"];
+                        "Fuente_Imagen", "Score_Match", "Validacion_IA", "Estado", "Revisar"];
+const OPCIONES_IA = [["", "No validar"], ["web", "Solo fotos de la web"], ["todas", "Todas las fotos"]];
+let CONFIG = { ia_disponible: false, modelo_ia: "", tiendas: [] };
+
+function iconoIA(v) {
+  if (!v) return "";
+  if (v.startsWith("Aprobada")) return "✅";
+  if (v.startsWith("Rechazadas")) return "❌";
+  return "➖";
+}
 const CONCURRENCIA = 3;
 const store = {
   get(k) { try { return localStorage.getItem(k); } catch { return null; } },
@@ -239,12 +261,12 @@ function pedirClave(error = false) {
   });
 }
 
-async function buscarProducto({ texto, ean, modo, solo_oficiales }, intentos = 3) {
+async function buscarProducto({ texto, ean, modo, solo_oficiales, validar_ia }, intentos = 3) {
   for (let i = 1; ; i++) {
     try {
       const r = await api("/api/buscar", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ texto, ean, modo, solo_oficiales }),
+        body: JSON.stringify({ texto, ean, modo, solo_oficiales, validar_ia }),
       });
       const datos = await r.json().catch(() => ({ error: `Respuesta inválida (HTTP ${r.status})` }));
       if (r.ok) return datos;
@@ -283,7 +305,8 @@ $("btnDiag").addEventListener("click", async () => {
     const caidas = d.resultados.filter((f) => !f.ok).length;
     p.replaceChildren(
       el("strong", {}, caidas ? `${caidas} fuente(s) no responden` : "Todas las fuentes responden"),
-      el("p", { class: "muted" }, `Región del servidor: ${d.region} · Serper (Google): ${d.serper_configurado ? "configurado" : "no configurado"}`),
+      el("p", { class: "muted" }, `Región del servidor: ${d.region} · Serper (Google): ${d.serper_configurado ? "configurado" : "no configurado"}` +
+        ` · Validación con IA: ${d.ia_disponible ? d.modelo_ia : "no configurada"}`),
       lista,
     );
   } catch (e) {
@@ -315,6 +338,7 @@ function fichaResultado(consulta, r, modo) {
       : "No encontrada");
   }
   fila("Score", r.Score_Match != null ? `${r.Score_Match}%` : "N/A");
+  if (r.Validacion_IA) fila("Validación IA", `${iconoIA(r.Validacion_IA)} ${r.Validacion_IA}`);
   const cont = el("div", {}, dl);
   if (r.Revisar) cont.append(el("div", { class: "aviso" }, `⚠️ Revisar: ${r.Revisar}`));
   return el("div", { class: "resultado" }, img, cont);
@@ -328,7 +352,8 @@ $("formIndividual").addEventListener("submit", async (ev) => {
   $("btnBuscar").disabled = true;
   $("resInd").replaceChildren(el("p", { class: "muted" }, "Buscando en las tiendas…"));
   try {
-    const r = await buscarProducto({ texto, modo, solo_oficiales: $("estrictoInd").checked });
+    const r = await buscarProducto({ texto, modo, solo_oficiales: $("estrictoInd").checked,
+                                     validar_ia: $("iaInd").value || null });
     $("resInd").replaceChildren(fichaResultado(texto, r, modo));
   } catch (e) {
     $("resInd").replaceChildren(el("div", { class: "error" }, `Error: ${e.message}`));
@@ -418,6 +443,7 @@ function guardarProgreso() {
 $("btnIniciar").addEventListener("click", async () => {
   const colNombre = $("colNombre").value, colEan = $("colEan").value, modo = modoElegido("modoLote");
   const soloOficiales = $("estrictoLote").checked;
+  const validarIA = $("iaLote").value || null;
   const indices = indicesAProcesar();
   const pendientes = indices.filter((i) => !L.resultados[i]);
   if (!pendientes.length) { $("estadoLote").textContent = "No quedan filas pendientes."; return; }
@@ -437,7 +463,7 @@ $("btnIniciar").addEventListener("click", async () => {
       if (!texto && !ean) { L.resultados[i] = { Estado: "Vacía" }; continue; }
       const k = `${texto.toLowerCase()}|${ean || ""}`;
       try {
-        if (!cache.has(k)) cache.set(k, buscarProducto({ texto, ean, modo, solo_oficiales: soloOficiales }));
+        if (!cache.has(k)) cache.set(k, buscarProducto({ texto, ean, modo, solo_oficiales: soloOficiales, validar_ia: validarIA }));
         L.resultados[i] = { ...(await cache.get(k)) };
       } catch (e) {
         cache.delete(k);
@@ -529,10 +555,13 @@ function renderVista() {
     const r = L.resultados[i];
     const foto = r.Imagen_URL ? el("img", { src: r.Imagen_URL, loading: "lazy", alt: "", referrerPolicy: "no-referrer" }) : "";
     return el("tr", {},
-      el("td", {}, i + 1), el("td", {}, foto), el("td", { class: "nombre" }, String(L.filas[i][colNombre] ?? "")),
+      el("td", {}, i + 1), el("td", {}, foto),
+      el("td", { class: "nombre" }, String(L.filas[i][colNombre] ?? "") || `EAN ${r.EAN || ""}`),
       el("td", {}, el("span", { class: `chip ${(r.Estado || "").split(" ")[0]}` }, r.Estado || "")),
       el("td", {}, r.EAN || ""), el("td", {}, r.Score_Match != null ? r.Score_Match : ""),
-      el("td", {}, r.Fuente_EAN || r.Fuente_Imagen || ""), el("td", { class: "nombre" }, r.Match_Nombre || ""),
+      el("td", {}, r.Fuente_EAN || r.Fuente_Imagen || ""),
+      el("td", { title: r.Validacion_IA || "" }, iconoIA(r.Validacion_IA)),
+      el("td", { class: "nombre" }, r.Match_Nombre || ""),
       el("td", { class: "nombre" }, r.Revisar || ""),
     );
   }));
@@ -548,29 +577,94 @@ function descargarBlob(blob, nombre) {
   setTimeout(() => URL.revokeObjectURL(a.href), 5000);
 }
 
-$("btnExcel").addEventListener("click", () => {
-  const filas = L.filas.map((fila, i) => {
-    const r = L.resultados[i] || {};
-    const salida = {};
-    for (const c of L.columnas) salida[c] = fila[c];
-    for (const c of COLS_RESULTADO) {
-      let v = r[c];
-      if (c === "EAN_Valido" && v != null) v = v ? "Sí" : "No";
-      salida[c] = v == null ? "" : v;
-    }
-    return salida;
-  });
-  const hoja = XLSX.utils.json_to_sheet(filas);
-  // EAN como texto para que Excel no lo convierta a notación científica
-  const rango = XLSX.utils.decode_range(hoja["!ref"]);
-  const colEan = Object.keys(filas[0]).indexOf("EAN");
-  for (let f = 1; f <= rango.e.r; f++) {
-    const celda = hoja[XLSX.utils.encode_cell({ r: f, c: colEan })];
-    if (celda && celda.v !== "") { celda.t = "s"; celda.v = String(celda.v); celda.z = "@"; }
+// Miniatura JPEG (base64) de una imagen, achicada en el navegador para que el Excel no pese de más
+const LADO_MINIATURA = 80;
+const cacheMiniaturas = new Map();
+
+function miniatura(url) {
+  if (!cacheMiniaturas.has(url)) {
+    cacheMiniaturas.set(url, (async () => {
+      try {
+        const resp = await api(`/api/imagen?url=${encodeURIComponent(url)}`);
+        if (!resp.ok) return null;
+        const bmp = await createImageBitmap(await resp.blob());
+        const escala = (LADO_MINIATURA * 2) / Math.max(bmp.width, bmp.height); // x2 para que se vea nítida
+        const lienzo = document.createElement("canvas");
+        lienzo.width = Math.max(1, Math.round(bmp.width * escala));
+        lienzo.height = Math.max(1, Math.round(bmp.height * escala));
+        const ctx = lienzo.getContext("2d");
+        ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, lienzo.width, lienzo.height); // PNG transparente -> fondo blanco
+        ctx.drawImage(bmp, 0, 0, lienzo.width, lienzo.height);
+        return { base64: lienzo.toDataURL("image/jpeg", 0.85), ancho: lienzo.width, alto: lienzo.height };
+      } catch { return null; }
+    })());
   }
-  const libro = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(libro, hoja, "Resultados");
-  XLSX.writeFile(libro, `${nombreBase()}_resultados.xlsx`);
+  return cacheMiniaturas.get(url);
+}
+
+$("btnExcel").addEventListener("click", async () => {
+  const conFotos = $("miniaturas").checked;
+  $("btnExcel").disabled = true;
+  try {
+    const libro = new ExcelJS.Workbook();
+    const hoja = libro.addWorksheet("Resultados", { views: [{ state: "frozen", xSplit: conFotos ? 1 : 0, ySplit: 1 }] });
+    const columnas = [...(conFotos ? ["Foto"] : []), ...L.columnas.filter((c) => c !== "EAN"), ...COLS_RESULTADO];
+    hoja.columns = columnas.map((c) => ({
+      header: c, key: c,
+      width: c === "Foto" ? LADO_MINIATURA / 6.5 : ["Imagen_URL", "Match_Nombre", "Revisar", "Validacion_IA"].includes(c) ? 40 : 18,
+      style: c === "EAN" ? { numFmt: "@" } : {}, // EAN como texto: Excel no lo pasa a notación científica
+    }));
+    hoja.getRow(1).font = { bold: true };
+
+    L.filas.forEach((fila, i) => {
+      const r = L.resultados[i] || {};
+      const valores = {};
+      for (const c of L.columnas) valores[c] = fila[c];
+      for (const c of COLS_RESULTADO) {
+        let v = r[c];
+        if (c === "EAN_Valido" && v != null) v = v ? "Sí" : "No";
+        valores[c] = v == null ? (c === "EAN" ? fila.EAN || "" : "") : (c === "EAN" ? String(v) : v);
+      }
+      hoja.addRow(valores);
+    });
+
+    if (conFotos) {
+      const conImagen = L.filas.map((_, i) => [i, L.resultados[i]?.Imagen_URL]).filter(([, u]) => u);
+      const unicas = [...new Set(conImagen.map(([, u]) => u))];
+      let hechas = 0;
+      const cola = [...unicas];
+      await Promise.all(Array.from({ length: 6 }, async () => {
+        while (cola.length) {
+          await miniatura(cola.shift());
+          $("estadoLote").textContent = `Armando miniaturas para el Excel… ${++hechas}/${unicas.length}`;
+        }
+      }));
+      const idsImagen = new Map();
+      let fallidas = 0;
+      for (const [i, url] of conImagen) {
+        const m = await miniatura(url);
+        if (!m) { fallidas++; continue; }
+        if (!idsImagen.has(url)) idsImagen.set(url, libro.addImage({ base64: m.base64, extension: "jpeg" }));
+        const escala = LADO_MINIATURA / Math.max(m.ancho, m.alto);
+        hoja.addImage(idsImagen.get(url), {
+          tl: { col: 0.05, row: i + 1 + 0.05 },
+          ext: { width: m.ancho * escala, height: m.alto * escala },
+          editAs: "oneCell",
+        });
+        hoja.getRow(i + 2).height = LADO_MINIATURA * 0.75 + 4;
+      }
+      $("estadoLote").textContent = `📥 Excel listo con ${conImagen.length - fallidas} miniaturas` +
+        (fallidas ? ` (${fallidas} ${fallidas === 1 ? "foto no se pudo" : "fotos no se pudieron"} descargar)` : "");
+    }
+
+    const buffer = await libro.xlsx.writeBuffer();
+    descargarBlob(new Blob([buffer], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }),
+                  `${nombreBase()}_resultados.xlsx`);
+  } catch (e) {
+    $("estadoLote").textContent = `❌ No se pudo generar el Excel: ${e.message}`;
+  } finally {
+    $("btnExcel").disabled = false;
+  }
 });
 
 const EXT = { "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "image/gif": "gif", "image/avif": "avif" };
@@ -620,11 +714,29 @@ $("btnZip").addEventListener("click", async () => {
 });
 
 // ============================================================ inicio
+function configurarIA() {
+  document.querySelectorAll(".select-ia").forEach((s) => {
+    s.replaceChildren(...OPCIONES_IA.map(([v, t]) => el("option", { value: v }, t)));
+    s.disabled = !CONFIG.ia_disponible;
+  });
+  document.querySelectorAll(".nota-ia").forEach((n) => {
+    n.textContent = CONFIG.ia_disponible
+      ? `Descarta fotos de otro producto o con marca de agua (${CONFIG.modelo_ia}). Hace la búsqueda más lenta y tiene costo por foto.`
+      : "No disponible: el administrador tiene que configurar ANTHROPIC_API_KEY en Vercel.";
+  });
+}
+
 (async () => {
+  configurarIA();
   try {
     const r = await fetch("/api/estado");
-    const d = await r.json();
-    if (d.requiere_clave && !clave) await pedirClave();
+    CONFIG = { ...CONFIG, ...(await r.json()) };
+    configurarIA();
+    if (CONFIG.tiendas?.length) {
+      $("subtitulo").textContent = `Busca en ${CONFIG.tiendas.length} supermercados, farmacias y perfumerías ` +
+        `(${CONFIG.tiendas.join(", ")}), con fallback web y filtro anti-marcas de agua.`;
+    }
+    if (CONFIG.requiere_clave && !clave) await pedirClave();
   } catch {}
 })();
 </script>

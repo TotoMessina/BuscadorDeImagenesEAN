@@ -1,6 +1,7 @@
 """
 POST /api/buscar
-Body JSON: {"texto": "nombre o EAN", "ean": "opcional", "modo": "ambos|ean|imagen", "solo_oficiales": false}
+Body JSON: {"texto": "nombre o EAN", "ean": "opcional", "modo": "ambos|ean|imagen",
+            "solo_oficiales": false, "validar_ia": null | "web" | "todas"}
 Devuelve el resultado de un único producto. La página web llama a este endpoint una vez por producto.
 """
 
@@ -10,7 +11,7 @@ from http.server import BaseHTTPRequestHandler
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _comun import autorizado, responder_json, leer_json  # noqa: E402
-from buscador_productos import procesar_un_producto, MODOS  # noqa: E402
+from buscador_productos import procesar_un_producto, MODOS, VALIDAR_IA_OPCIONES  # noqa: E402
 
 
 class handler(BaseHTTPRequestHandler):
@@ -33,6 +34,7 @@ class handler(BaseHTTPRequestHandler):
                 serper_key=os.environ.get("SERPER_API_KEY") or None,
                 carpeta_imagenes=None,
                 solo_oficiales_vtex=bool(datos.get("solo_oficiales")),
+                validar_ia=datos.get("validar_ia") if datos.get("validar_ia") in VALIDAR_IA_OPCIONES else None,
             )
         except Exception as e:  # nunca devolver un 500 sin explicación a la página
             return responder_json(self, {"error": f"Error interno: {e}"}, 500)

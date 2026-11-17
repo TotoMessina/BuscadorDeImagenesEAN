@@ -18,6 +18,9 @@ from buscador_productos import (
     leer_tabla,
     guardar_tabla,
     detectar_columna,
+    guardar_excel_con_miniaturas,
+    ia_disponible,
+    MODELO_VISION,
     COLUMNAS_NOMBRE_POSIBLES,
     COLUMNAS_EAN_POSIBLES,
 )
@@ -32,12 +35,22 @@ OPCIONES_MODO = {
 }
 
 
+OPCIONES_IA = {
+    "No validar": None,
+    "Solo fotos de la web": "web",
+    "Todas las fotos": "todas",
+}
+AYUDA_IA = (f"Usa {MODELO_VISION} para descartar fotos de otro producto o con marca de agua."
+            if ia_disponible() else
+            "No disponible: falta configurar la variable ANTHROPIC_API_KEY antes de abrir la interfaz.")
+
+
 def _clave_serper(texto):
     texto = (texto or "").strip() or os.environ.get("SERPER_API_KEY", "")
     return texto or None
 
 
-def buscar_individual(texto, modo_txt, serper_key, solo_oficiales=False):
+def buscar_individual(texto, modo_txt, serper_key, solo_oficiales=False, ia_txt="No validar"):
     """Búsqueda rápida para un único producto (nombre o código EAN)."""
     if not texto or not texto.strip():
         return None, "Escribí el nombre de un producto o un código EAN."
@@ -49,6 +62,7 @@ def buscar_individual(texto, modo_txt, serper_key, solo_oficiales=False):
         serper_key=_clave_serper(serper_key),
         carpeta_imagenes=os.path.join(CARPETA_BASE, "individual") if modo != "ean" else None,
         solo_oficiales_vtex=solo_oficiales,
+        validar_ia=OPCIONES_IA.get(ia_txt),
     )
 
     img = res["Imagen_Local"] or res["Imagen_URL"]
@@ -65,6 +79,8 @@ def buscar_individual(texto, modo_txt, serper_key, solo_oficiales=False):
     if modo != "ean":
         filas.append(f"**Imagen:** {res['Imagen_URL'] or 'No encontrada'} — _{res['Fuente_Imagen'] or '-'}_")
     filas.append(f"**Score de coincidencia:** {score}")
+    if res["Validacion_IA"]:
+        filas.append(f"**Validación IA:** {res['Validacion_IA']}")
     if res["Revisar"]:
         filas.append(f"**⚠️ Revisar:** {res['Revisar']}")
     return img, "  \n".join(filas)
@@ -94,7 +110,7 @@ def previsualizar_archivo(archivo):
 
 
 def procesar_lote(archivo, columna, columna_ean, modo_txt, descargar_fotos, serper_key, max_filas,
-                  solo_oficiales=False, progress=gr.Progress()):
+                  solo_oficiales=False, ia_txt="No validar", miniaturas=True, progress=gr.Progress()):
     """Procesa el lote completo con barra de progreso."""
     if archivo is None:
         raise gr.Error("Tenés que cargar un archivo Excel o CSV.")
@@ -123,10 +139,17 @@ def procesar_lote(archivo, columna, columna_ean, modo_txt, descargar_fotos, serp
         serper_key=_clave_serper(serper_key),
         carpeta_imagenes=carpeta_imgs if (descargar_fotos and modo != "ean") else None,
         solo_oficiales_vtex=solo_oficiales,
+        validar_ia=OPCIONES_IA.get(ia_txt),
         max_filas=int(max_filas) if max_filas and int(max_filas) > 0 else None,
         on_progreso=on_progreso,
         on_guardar=lambda d: guardar_tabla(d, ruta_excel),
     )
+
+    if miniaturas and modo != "ean":
+        guardar_excel_con_miniaturas(
+            df, ruta_excel,
+            on_progreso=lambda i, n: progress(i / n, desc=f"Agregando miniaturas al Excel {i}/{n}"),
+        )
 
     zip_ruta = None
     if os.path.isdir(carpeta_imgs) and os.listdir(carpeta_imgs):
@@ -146,10 +169,11 @@ def procesar_lote(archivo, columna, columna_ean, modo_txt, descargar_fotos, serp
     )
 
     columnas_mostrar = [columna, "Estado", "EAN", "Score_Match", "Fuente_EAN", "Fuente_Imagen",
-                        "Match_Nombre", "Revisar", "Imagen_URL"]
+                        "Validacion_IA", "Match_Nombre", "Revisar", "Imagen_URL"]
     if modo == "ean":
         columnas_mostrar.remove("Fuente_Imagen")
         columnas_mostrar.remove("Imagen_URL")
+        columnas_mostrar.remove("Validacion_IA")
     columnas_existentes = [c for c in columnas_mostrar if c in df.columns]
 
     return ruta_excel, zip_ruta, df[columnas_existentes].head(50), resumen
@@ -158,7 +182,9 @@ def procesar_lote(archivo, columna, columna_ean, modo_txt, descargar_fotos, serp
 with gr.Blocks(title="Buscador de EAN e Imágenes") as demo:
     gr.Markdown("""
     # 🔍 Buscador de Códigos EAN e Imágenes de Producto
-    Busca en catálogos oficiales de **Carrefour, Jumbo, ChangoMás, Día, Farmacity, Disco y Vea**
+    Busca en los catálogos de **16 supermercados, farmacias y perfumerías** (Carrefour, Jumbo, ChangoMás, Día,
+    Farmacity, Disco, Vea, Josimar, Cordiez, Toledo, Farmaonline, Farmacias del Pueblo, Simplicity, Get The Look,
+    Pigmento y Juleriaque)
     (todas a la vez), con fallback web y filtros anti-marcas de agua.
     Podés buscar **EAN + imagen**, **solo EAN** o **solo imagen**.
     """)
@@ -175,13 +201,15 @@ with gr.Blocks(title="Buscador de EAN e Imágenes") as demo:
                     modo_individual = gr.Radio(list(OPCIONES_MODO), value="EAN + Imagen", label="¿Qué buscar?")
                     solo_oficiales_individual = gr.Checkbox(label="🛡️ Solo catálogos oficiales (0% marcas de agua)",
                                                             value=False)
+                    ia_individual = gr.Radio(list(OPCIONES_IA), value="No validar", label="🤖 Validar fotos con IA",
+                                             info=AYUDA_IA, interactive=ia_disponible())
                     serper_individual = gr.Textbox(label="Serper API Key (opcional)", type="password")
                     btn_buscar_uno = gr.Button("Buscar", variant="primary")
                 with gr.Column():
                     imagen_preview = gr.Image(label="Imagen encontrada", type="filepath")
                     detalles_md = gr.Markdown("Escribí un producto para ver la información.")
 
-            entradas = [prod_nombre, modo_individual, serper_individual, solo_oficiales_individual]
+            entradas = [prod_nombre, modo_individual, serper_individual, solo_oficiales_individual, ia_individual]
             btn_buscar_uno.click(fn=buscar_individual, inputs=entradas, outputs=[imagen_preview, detalles_md])
             prod_nombre.submit(fn=buscar_individual, inputs=entradas, outputs=[imagen_preview, detalles_md])
 
@@ -197,6 +225,9 @@ with gr.Blocks(title="Buscador de EAN e Imágenes") as demo:
                                                        interactive=True)
                     modo_lote = gr.Radio(list(OPCIONES_MODO), value="EAN + Imagen", label="¿Qué buscar?")
                     descargar_check = gr.Checkbox(label="Descargar imágenes (ZIP)", value=True)
+                    miniaturas_check = gr.Checkbox(label="🖼️ Miniaturas de las fotos dentro del Excel", value=True)
+                    ia_lote = gr.Radio(list(OPCIONES_IA), value="No validar", label="🤖 Validar fotos con IA",
+                                       info=AYUDA_IA, interactive=ia_disponible())
                     solo_oficiales_check = gr.Checkbox(
                         label="🛡️ Modo estricto: solo catálogos oficiales (0% marcas de agua)", value=False,
                         info="Si el producto no está en un catálogo oficial, no trae fotos dudosas de la web.",
@@ -222,7 +253,7 @@ with gr.Blocks(title="Buscador de EAN e Imágenes") as demo:
             btn_procesar.click(
                 fn=procesar_lote,
                 inputs=[archivo_input, columna_dropdown, columna_ean_dropdown, modo_lote, descargar_check,
-                        serper_key_input, max_filas_input, solo_oficiales_check],
+                        serper_key_input, max_filas_input, solo_oficiales_check, ia_lote, miniaturas_check],
                 outputs=[descarga_excel, descarga_zip, tabla_resultados, resumen_texto],
             )
 
