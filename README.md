@@ -19,6 +19,7 @@ Se puede usar de tres formas:
 ## Estructura
 
 ```
+app.py                  Punto de entrada de Vercel: sirve index.html y las rutas /api/* (usa las clases de api/)
 index.html              Página web (consulta individual + procesamiento de Excel en el navegador)
 api/buscar.py           Función de Vercel: busca UN producto (la página la llama por cada fila)
 api/imagen.py           Función de Vercel: descarga imágenes para el ZIP y las miniaturas del Excel
@@ -27,7 +28,7 @@ buscador_productos.py   Lógica de búsqueda (la usan la web, la consola y Gradi
 vercel.json             Configuración de Vercel (región São Paulo, tiempo máximo)
 requirements.txt        Librerías que instala Vercel
 requirements-local.txt  Librerías para usarlo en tu PC (consola / Gradio)
-dev_server.py           Simula Vercel en tu PC para probar antes de subir
+dev_server.py           Corre app.py en tu PC (http://localhost:3000) para probar antes de subir
 ```
 
 ## Probar en tu PC antes de subir

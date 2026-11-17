@@ -1,11 +1,9 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
-  "framework": null,
   "regions": ["gru1"],
   "functions": {
-    "api/*.py": {
-      "maxDuration": 60,
-      "includeFiles": "buscador_productos.py"
+    "app.py": {
+      "maxDuration": 60
     }
   }
 }
