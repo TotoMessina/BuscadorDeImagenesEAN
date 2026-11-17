@@ -1,0 +1,13 @@
+# Archivos que NO se suben a Vercel
+*.xlsx
+*.xls
+*.csv
+*.zip
+imagenes/
+imagenes_web/
+resultados_web/
+respaldo_original/
+__pycache__/
+interfaz_web.py
+dev_server.py
+requirements-local.txt

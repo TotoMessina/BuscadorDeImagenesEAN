@@ -1,0 +1,6 @@
+# Para usar el script por consola o la interfaz Gradio en tu PC:
+#   pip install -r requirements-local.txt
+-r requirements.txt
+pandas>=2.0
+openpyxl>=3.1
+gradio>=5.0

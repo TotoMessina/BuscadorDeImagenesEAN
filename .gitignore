@@ -1,0 +1,18 @@
+# Datos de trabajo (no subir listas de productos ni imágenes al repositorio)
+*.xlsx
+*.xls
+*.csv
+*.zip
+imagenes/
+imagenes_web/
+resultados_web/
+respaldo_original/
+
+# Python / Vercel
+__pycache__/
+*.pyc
+.vercel/
+.env
+
+# Configuración local de Claude Code
+.claude/

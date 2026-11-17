@@ -1,0 +1,4 @@
+# Dependencias de las funciones de Vercel (carpeta api/)
+requests>=2.31
+rapidfuzz>=3.0
+ddgs>=9.0
