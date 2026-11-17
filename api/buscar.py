@@ -1,7 +1,7 @@
 """
 POST /api/buscar
 Body JSON: {"texto": "nombre o EAN", "ean": "opcional", "modo": "ambos|ean|imagen",
-            "solo_oficiales": false, "validar_ia": null | "web" | "todas"}
+            "solo_oficiales": false, "validar_ia": null | "web" | "todas", "usar_catalogo": true}
 Devuelve el resultado de un único producto. La página web llama a este endpoint una vez por producto.
 """
 
@@ -35,6 +35,7 @@ class handler(BaseHTTPRequestHandler):
                 carpeta_imagenes=None,
                 solo_oficiales_vtex=bool(datos.get("solo_oficiales")),
                 validar_ia=datos.get("validar_ia") if datos.get("validar_ia") in VALIDAR_IA_OPCIONES else None,
+                usar_catalogo=datos.get("usar_catalogo", True) is not False,
             )
         except Exception as e:  # nunca devolver un 500 sin explicación a la página
             return responder_json(self, {"error": f"Error interno: {e}"}, 500)

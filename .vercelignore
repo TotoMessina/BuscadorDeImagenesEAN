@@ -11,3 +11,5 @@ __pycache__/
 interfaz_web.py
 dev_server.py
 requirements-local.txt
+.env
+supabase_catalogo.sql

@@ -14,6 +14,7 @@ from urllib.parse import urlparse, parse_qs
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _comun import autorizado, clave_requerida, responder_json  # noqa: E402
 from buscador_productos import TIENDAS_VTEX, session, _pool_tiendas, _importar_ddgs, ia_disponible, MODELO_VISION  # noqa: E402
+import catalogo_db as catalogo  # noqa: E402
 
 EAN_PRUEBA = "7790895000997"  # Coca-Cola 2,25 L, presente en casi todos los supermercados
 
@@ -57,6 +58,7 @@ class handler(BaseHTTPRequestHandler):
                 "ia_disponible": ia_disponible(),
                 "modelo_ia": MODELO_VISION,
                 "tiendas": [n for n, _ in TIENDAS_VTEX],
+                "catalogo": catalogo.estado_catalogo(),
             })
 
         if not autorizado(self):
@@ -69,5 +71,6 @@ class handler(BaseHTTPRequestHandler):
             "serper_configurado": bool(os.environ.get("SERPER_API_KEY")),
             "ia_disponible": ia_disponible(),
             "modelo_ia": MODELO_VISION,
+            "catalogo": catalogo.estado_catalogo(),
             "resultados": resultados,
         })

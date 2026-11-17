@@ -25,6 +25,9 @@ api/buscar.py           Función de Vercel: busca UN producto (la página la lla
 api/imagen.py           Función de Vercel: descarga imágenes para el ZIP y las miniaturas del Excel
 api/estado.py           Función de Vercel: pide clave / diagnóstico de las fuentes
 api/candidatas.py       Función de Vercel: opciones de fotos y productos para la pantalla de revisión
+api/catalogo.py         Función de Vercel: listar, confirmar y borrar productos del catálogo del equipo
+catalogo_db.py          Conexión con Supabase (catálogo del equipo)
+supabase_catalogo.sql   SQL para crear la tabla del catálogo (se ejecuta una vez en Supabase)
 buscador_productos.py   Lógica de búsqueda (la usan la web, la consola y Gradio)
 vercel.json             Configuración de Vercel (región São Paulo, tiempo máximo)
 requirements.txt        Librerías que instala Vercel
@@ -76,6 +79,26 @@ Cada `git push` a `main` vuelve a publicar la web automáticamente.
 - Columnas con datos del producto (de la tienda donde se encontró): `Categoria` (ej. "Bebidas > Gaseosas > Gaseosas cola"), `Contenido_Neto` (ej. "473 ml"), `Descripcion`, `Link_Producto`. La `Marca` sale normalizada ("CAMPO AUSTRAL" → "Campo Austral").
 - Con **Miniaturas en el Excel** (activado por defecto), el Excel descargado trae una primera columna `Foto` con la imagen de cada producto.
 - Con **Fotos listas para publicar** (activado por defecto), el ZIP trae cada foto recortada, centrada en un cuadrado de 1000×1000 con fondo blanco, en JPG y nombrada por EAN. Sirven directo para tienda online, MercadoLibre o catálogo.
+
+## Catálogo del equipo (Supabase)
+
+Cada producto confirmado queda guardado en una base de datos compartida, así nadie busca dos veces lo mismo:
+
+- **Las búsquedas consultan el catálogo primero.** Si el producto ya está, la respuesta es instantánea (`Fuente: Catálogo del equipo`).
+- **Se guarda solo:** todo resultado completo y confiable (EAN + foto, sin nada para revisar).
+- **Lo que corrige una persona tiene prioridad:** las elecciones de la pantalla de revisión y el botón **💾 Guardar como correcto** de la consulta individual se guardan como *confirmados*, y ninguna búsqueda automática los pisa. Sirve también para productos de mayorista que no están en ninguna tienda (por ejemplo, solo con la foto).
+- **Pestaña 📚 Catálogo:** buscar, ver cuántas veces se reutilizó cada producto, borrar y **exportar todo a Excel** (tu catálogo maestro).
+- Casilla **Usar catálogo del equipo** para buscar ignorándolo (en consola: `--sin-catalogo`).
+
+### Configuración (una sola vez)
+
+1. **Crear la tabla:** en Supabase, *SQL Editor → New query*, pegar el contenido de [`supabase_catalogo.sql`](supabase_catalogo.sql) y *Run*.
+2. **Vercel:** *Settings → Environment Variables*, agregar y hacer *Redeploy*:
+   - `SUPABASE_URL` = `https://<tu-proyecto>.supabase.co`
+   - `SUPABASE_KEY` = la clave secreta (`sb_secret_...`, en Supabase: *Project Settings → API Keys*)
+3. **En tu PC (consola, Gradio, `dev_server.py`):** archivo `.env` en esta carpeta con esas dos líneas. Git lo ignora, así que la clave no se sube a GitHub.
+
+La clave secreta da acceso total a la base: va solo en el servidor (Vercel o `.env`), nunca en la página ni en el código. La tabla tiene RLS activado, así que la clave pública de Supabase no puede leerla.
 
 ## Pantalla de revisión
 

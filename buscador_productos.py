@@ -41,6 +41,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 import requests
 from requests.adapters import HTTPAdapter
+
+import catalogo_db as catalogo
 from rapidfuzz import fuzz
 
 try:
@@ -889,6 +891,7 @@ def procesar_un_producto(
     carpeta_imagenes=None,
     solo_oficiales_vtex=False,
     validar_ia=None,
+    usar_catalogo=True,
 ):
     """
     Ejecuta el pipeline de búsqueda para un único producto.
@@ -899,6 +902,7 @@ def procesar_un_producto(
     solo_oficiales_vtex: si es True, solo acepta imágenes de catálogos oficiales VTEX.
     validar_ia: None (no validar) | 'web' (validar las fotos de DuckDuckGo/Google) |
                 'todas' (validar también las de VTEX). Requiere ANTHROPIC_API_KEY.
+    usar_catalogo: consultar primero el catálogo del equipo (Supabase) y guardar ahí los resultados confiables.
     """
     if modo not in MODOS:
         raise ValueError(f"modo debe ser uno de {MODOS}")
@@ -910,6 +914,15 @@ def procesar_un_producto(
     if not ean_conocido and re.fullmatch(r'\d{8,14}', nombre_original):
         ean_conocido = nombre_original
     ean_conocido = normalizar_ean_celda(ean_conocido)
+
+    # 0. Catálogo del equipo: si el producto ya está, se responde al instante
+    clave_cat = catalogo.clave_producto(limpiar_nombre_producto(nombre_original)) if not nombre_original.isdigit() else None
+    usar_catalogo = usar_catalogo and catalogo.catalogo_disponible()
+    if usar_catalogo:
+        fila = catalogo.buscar(clave_cat, ean_conocido)
+        if fila and _fila_catalogo_sirve(fila, modo, ean_conocido):
+            catalogo.sumar_uso(fila.get("id"))
+            return _resultado_desde_catalogo(fila, modo, ean_conocido, nombre_original, carpeta_imagenes)
 
     necesita_ean = modo in ("ambos", "ean") and not ean_conocido
     necesita_img = modo in ("ambos", "imagen")
@@ -1053,7 +1066,7 @@ def procesar_un_producto(
     if not img_url and rechazos_ia:
         motivos.append("todas las fotos candidatas fueron descartadas por la IA")
 
-    return {
+    resultado = {
         "EAN": ean,
         "EAN_Valido": ean_valido(ean) if ean else None,
         "Imagen_URL": img_url,
@@ -1071,6 +1084,90 @@ def procesar_un_producto(
         "Estado": estado,
         "Revisar": "; ".join(motivos) if motivos else None,
     }
+
+    # 6. Guardar en el catálogo del equipo solo lo completo y confiable (EAN + foto, sin nada para revisar).
+    #    No pisa lo que ya existe: lo confirmado por una persona siempre gana.
+    if usar_catalogo and clave_cat and ean and img_url and not motivos:
+        catalogo.guardar(registro_catalogo(nombre_original, resultado), confirmado=False)
+    return resultado
+
+
+def _fila_catalogo_sirve(fila, modo, ean_conocido):
+    """¿Alcanza lo que hay en el catálogo para responder sin buscar?"""
+    if ean_conocido and fila.get("ean") and fila["ean"] != ean_conocido:
+        return False  # la lista trae otro EAN: mejor buscar de nuevo
+    if fila.get("confirmado"):
+        return True   # lo decidió una persona, aunque le falte algo (ej. productos de mayorista sin EAN)
+    return bool({"ambos": fila.get("ean") and fila.get("imagen_url"),
+                 "ean": fila.get("ean"), "imagen": fila.get("imagen_url")}[modo])
+
+
+def _resultado_desde_catalogo(fila, modo, ean_conocido, nombre_original, carpeta_imagenes):
+    ean = ean_conocido or fila.get("ean")
+    img_url = fila.get("imagen_url") if modo != "ean" else None
+    origen = "Catálogo del equipo" + (" (confirmado)" if fila.get("confirmado") else "")
+    ruta_local = None
+    if img_url and carpeta_imagenes:
+        ruta_local = descargar_imagen(img_url, os.path.join(carpeta_imagenes, ean or nombre_archivo_seguro(nombre_original)))
+    tiene_ean, tiene_img = bool(ean), bool(img_url)
+    objetivo = {"ambos": tiene_ean and tiene_img, "ean": tiene_ean, "imagen": tiene_img}[modo]
+    return {
+        "EAN": ean,
+        "EAN_Valido": ean_valido(ean) if ean else None,
+        "Imagen_URL": img_url,
+        "Imagen_Local": ruta_local,
+        "Match_Nombre": fila.get("match_nombre"),
+        "Marca": fila.get("marca"),
+        "Fuente_EAN": ("Dato de entrada" if ean_conocido else origen) if ean else None,
+        "Fuente_Imagen": origen if img_url else None,
+        "Score_Match": float(fila["score"]) if fila.get("score") is not None else None,
+        "Validacion_IA": None,
+        "Categoria": fila.get("categoria"),
+        "Contenido_Neto": fila.get("contenido_neto") or formatear_contenido(nombre_original),
+        "Descripcion": fila.get("descripcion"),
+        "Link_Producto": fila.get("link_producto"),
+        "Estado": "OK" if objetivo else ("Parcial" if tiene_ean or tiene_img else "No encontrado"),
+        "Revisar": None,
+    }
+
+
+def registro_catalogo(nombre_original, resultado):
+    """Arma la fila para el catálogo a partir de un resultado del buscador (o de una corrección manual)."""
+    nombre_original = str(nombre_original or "").strip()
+    clave = None
+    if nombre_original and not nombre_original.isdigit():
+        clave = catalogo.clave_producto(limpiar_nombre_producto(nombre_original))
+    ean = normalizar_ean_celda(resultado.get("EAN"))
+    if not clave and ean:
+        clave = f"ean:{ean}"  # productos cargados solo por código
+    score = resultado.get("Score_Match")
+    try:
+        score = float(score) if score not in (None, "") else None
+    except (TypeError, ValueError):
+        score = None
+    return {
+        "clave": clave,
+        "nombre_original": nombre_original or None,
+        "ean": ean,
+        "imagen_url": resultado.get("Imagen_URL") or None,
+        "match_nombre": resultado.get("Match_Nombre") or None,
+        "marca": resultado.get("Marca") or None,
+        "categoria": resultado.get("Categoria") or None,
+        "contenido_neto": resultado.get("Contenido_Neto") or None,
+        "descripcion": resultado.get("Descripcion") or None,
+        "link_producto": resultado.get("Link_Producto") or None,
+        "fuente_ean": resultado.get("Fuente_EAN") or None,
+        "fuente_imagen": resultado.get("Fuente_Imagen") or None,
+        "score": score,
+    }
+
+
+def confirmar_en_catalogo(nombre_original, resultado):
+    """Guarda (o reemplaza) un producto como confirmado por una persona. Devuelve True si se guardó."""
+    registro = registro_catalogo(nombre_original, resultado)
+    if not registro["clave"] or not (registro["ean"] or registro["imagen_url"]):
+        return False
+    return catalogo.guardar(registro, confirmado=True)
 
 
 # =============================================================================
@@ -1304,6 +1401,7 @@ def procesar_dataframe(
     carpeta_imagenes=None,
     solo_oficiales_vtex=False,
     validar_ia=None,
+    usar_catalogo=True,
     max_filas=None,
     reintentar=False,
     on_progreso=None,
@@ -1360,6 +1458,7 @@ def procesar_dataframe(
                     carpeta_imagenes=carpeta_imagenes,
                     solo_oficiales_vtex=solo_oficiales_vtex,
                     validar_ia=validar_ia,
+                    usar_catalogo=usar_catalogo,
                 )
                 cache[clave] = res
                 time.sleep(pausa)
@@ -1401,6 +1500,7 @@ def procesar_archivo(
     validar_ia=None,
     miniaturas=False,
     fotos_publicar=False,
+    usar_catalogo=True,
 ):
     """Procesa un Excel/CSV con guardado incremental y reanudación automática."""
     if not os.path.exists(archivo_entrada):
@@ -1427,6 +1527,12 @@ def procesar_archivo(
         print("[INFO] Filtro estricto: solo imágenes de catálogos oficiales VTEX", flush=True)
     if descargar_fotos:
         print(f"[INFO] Descarga de imágenes en carpeta: '{carpeta_imagenes}'", flush=True)
+    if usar_catalogo:
+        estado_cat = catalogo.estado_catalogo()
+        if estado_cat["ok"]:
+            print(f"[INFO] Catálogo del equipo: conectado ({estado_cat['productos']} productos)", flush=True)
+        else:
+            print(f"[AVISO] Catálogo del equipo: {estado_cat['detalle']}. Se busca sin catálogo.", flush=True)
     if validar_ia:
         if ia_disponible():
             alcance = "todas las imágenes" if validar_ia == "todas" else "las imágenes de la web"
@@ -1468,7 +1574,8 @@ def procesar_archivo(
             df, columna_producto, modo=modo, columna_ean=columna_ean,
             serper_key=serper_key,
             carpeta_imagenes=carpeta_imagenes if descargar_fotos else None,
-            solo_oficiales_vtex=solo_oficiales_vtex, validar_ia=validar_ia, max_filas=max_filas,
+            solo_oficiales_vtex=solo_oficiales_vtex, validar_ia=validar_ia, usar_catalogo=usar_catalogo,
+            max_filas=max_filas,
             reintentar=reintentar, on_progreso=progreso,
             on_guardar=lambda d: guardar_tabla(d, archivo_salida),
         )
@@ -1532,6 +1639,8 @@ if __name__ == "__main__":
     parser.add_argument("--fotos-publicar", action="store_true",
                         help="Generar fotos listas para publicar (1000x1000, fondo blanco, nombradas por EAN) "
                              "en <images-dir>/publicar")
+    parser.add_argument("--sin-catalogo", action="store_true",
+                        help="No consultar ni guardar en el catálogo del equipo (Supabase)")
     parser.add_argument("--reintentar", action="store_true",
                         help="Volver a buscar las filas que en una corrida previa quedaron incompletas")
 
@@ -1545,6 +1654,7 @@ if __name__ == "__main__":
             carpeta_imagenes=args.images_dir if args.download_images else None,
             solo_oficiales_vtex=args.solo_oficiales,
             validar_ia=args.validar_ia,
+            usar_catalogo=not args.sin_catalogo,
         )
         imprimir_resultado(entrada, res)
         sys.exit(0)
@@ -1565,4 +1675,5 @@ if __name__ == "__main__":
         validar_ia=args.validar_ia,
         miniaturas=args.miniaturas,
         fotos_publicar=args.fotos_publicar,
+        usar_catalogo=not args.sin_catalogo,
     )

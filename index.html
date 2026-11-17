@@ -131,6 +131,7 @@
     <button class="tab" role="tab" aria-selected="true" data-tab="individual">🔎 Consulta individual</button>
     <button class="tab" role="tab" aria-selected="false" data-tab="lote">📁 Procesar Excel / CSV</button>
     <button class="tab" role="tab" aria-selected="false" data-tab="revision" id="tabRevision">🧐 Revisión</button>
+    <button class="tab" role="tab" aria-selected="false" data-tab="catalogo">📚 Catálogo</button>
   </div>
 
   <!-- ===================== CONSULTA INDIVIDUAL ===================== -->
@@ -140,6 +141,8 @@
       <input type="text" id="texto" placeholder="Ej: TOSTADITAS TIA MARUCA x120 gr  —  o  7790895000997" autocomplete="off" required>
       <label class="campo">¿Qué buscar?</label>
       <div class="seg" data-grupo="modoInd"></div>
+      <label class="check"><input type="checkbox" id="catalogoInd" class="usar-catalogo" checked>
+        <span>Usar catálogo del equipo<small class="nota-catalogo">Lo ya confirmado sale al instante</small></span></label>
       <label class="check"><input type="checkbox" id="estrictoInd">
         <span>Solo catálogos oficiales<small>Sin fotos de la web (0% marcas de agua)</small></span></label>
       <div class="bloque-ia">
@@ -167,6 +170,8 @@
         <select id="colEan"></select>
         <label class="campo">¿Qué buscar?</label>
         <div class="seg" data-grupo="modoLote"></div>
+        <label class="check"><input type="checkbox" id="catalogoLote" class="usar-catalogo" checked>
+          <span>Usar catálogo del equipo<small class="nota-catalogo">Lo ya confirmado sale al instante</small></span></label>
         <label class="check"><input type="checkbox" id="estrictoLote">
           <span>Solo catálogos oficiales<small>Sin fotos de la web (0% marcas de agua)</small></span></label>
         <div class="bloque-ia">
@@ -204,6 +209,29 @@
         </tr></thead><tbody id="tbody"></tbody></table></div>
         <p class="muted" id="notaTabla"></p>
       </div>
+    </div>
+  </section>
+
+  <!-- ===================== CATÁLOGO ===================== -->
+  <section id="tab-catalogo" class="oculto">
+    <div class="panel">
+      <div class="rev-cabecera">
+        <div>
+          <strong id="catTitulo">Catálogo del equipo</strong>
+          <p class="muted" style="margin:2px 0 0">Productos guardados por todo el equipo. ✓ = confirmado por una persona (tiene prioridad
+            sobre las búsquedas automáticas). Las próximas búsquedas los usan primero.</p>
+        </div>
+        <button class="btn" id="btnExportarCat">📥 Exportar todo a Excel</button>
+      </div>
+      <div class="manual" style="margin:0 0 6px">
+        <input type="text" id="catBuscar" placeholder="Buscar por nombre, marca o EAN">
+        <label class="check" style="margin:0;align-items:center;white-space:nowrap"><input type="checkbox" id="catConfirmados"> Solo confirmados</label>
+      </div>
+      <p class="muted" id="catEstado"></p>
+      <div class="tabla-wrap"><table><thead><tr>
+        <th>Foto</th><th>Nombre en la lista</th><th>EAN</th><th>Producto</th><th>Marca</th><th>Categoría</th><th>Contenido</th><th>✓</th><th>Usos</th><th>Actualizado</th><th></th>
+      </tr></thead><tbody id="catTbody"></tbody></table></div>
+      <div class="fila-btns" id="catPaginas"></div>
     </div>
   </section>
 
@@ -245,7 +273,7 @@ const COLS_RESULTADO = ["EAN", "EAN_Valido", "Imagen_URL", "Match_Nombre", "Marc
                         "Fuente_Imagen", "Score_Match", "Validacion_IA", "Estado", "Revisar",
                         "Categoria", "Contenido_Neto", "Descripcion", "Link_Producto", "Revisado_Manual"];
 const OPCIONES_IA = [["", "No validar"], ["web", "Solo fotos de la web"], ["todas", "Todas las fotos"]];
-let CONFIG = { ia_disponible: false, modelo_ia: "", tiendas: [] };
+let CONFIG = { ia_disponible: false, modelo_ia: "", tiendas: [], catalogo: { ok: false, detalle: "" } };
 
 function iconoIA(v) {
   if (!v) return "";
@@ -300,12 +328,12 @@ function pedirClave(error = false) {
   });
 }
 
-async function buscarProducto({ texto, ean, modo, solo_oficiales, validar_ia }, intentos = 3) {
+async function buscarProducto({ texto, ean, modo, solo_oficiales, validar_ia, usar_catalogo = true }, intentos = 3) {
   for (let i = 1; ; i++) {
     try {
       const r = await api("/api/buscar", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ texto, ean, modo, solo_oficiales, validar_ia }),
+        body: JSON.stringify({ texto, ean, modo, solo_oficiales, validar_ia, usar_catalogo }),
       });
       const datos = await r.json().catch(() => ({ error: `Respuesta inválida (HTTP ${r.status})` }));
       if (r.ok) return datos;
@@ -320,11 +348,12 @@ async function buscarProducto({ texto, ean, modo, solo_oficiales, validar_ia }, 
 // ============================================================ pestañas
 document.querySelectorAll(".tab").forEach((t) => t.addEventListener("click", () => {
   document.querySelectorAll(".tab").forEach((x) => x.setAttribute("aria-selected", x === t));
-  for (const nombre of ["individual", "lote", "revision"]) {
+  for (const nombre of ["individual", "lote", "revision", "catalogo"]) {
     $(`tab-${nombre}`).classList.toggle("oculto", t.dataset.tab !== nombre);
   }
   store.set("pestana", t.dataset.tab);
   if (t.dataset.tab === "revision") renderRevision();
+  if (t.dataset.tab === "catalogo") cargarCatalogo();
 }));
 if (store.get("pestana") === "lote") document.querySelector('[data-tab="lote"]').click();
 
@@ -347,7 +376,8 @@ $("btnDiag").addEventListener("click", async () => {
     p.replaceChildren(
       el("strong", {}, caidas ? `${caidas} fuente(s) no responden` : "Todas las fuentes responden"),
       el("p", { class: "muted" }, `Región del servidor: ${d.region} · Serper (Google): ${d.serper_configurado ? "configurado" : "no configurado"}` +
-        ` · Validación con IA: ${d.ia_disponible ? d.modelo_ia : "no configurada"}`),
+        ` · Validación con IA: ${d.ia_disponible ? d.modelo_ia : "no configurada"}` +
+        ` · Catálogo del equipo: ${d.catalogo?.ok ? `conectado (${d.catalogo.productos} productos)` : d.catalogo?.detalle || "no configurado"}`),
       lista,
     );
   } catch (e) {
@@ -447,7 +477,7 @@ $("formIndividual").addEventListener("submit", async (ev) => {
   $("resInd").replaceChildren(el("p", { class: "muted" }, "Buscando en las tiendas…"));
   try {
     const r = await buscarProducto({ texto, modo, solo_oficiales: $("estrictoInd").checked,
-                                     validar_ia: $("iaInd").value || null });
+                                     validar_ia: $("iaInd").value || null, usar_catalogo: usaCatalogo("catalogoInd") });
     const zonaOpciones = el("div", { style: "margin-top:16px" });
     const btnOpciones = el("button", { type: "button", class: "btn" }, "🔄 Ver otras opciones");
     btnOpciones.onclick = async () => {
@@ -458,7 +488,9 @@ $("formIndividual").addEventListener("submit", async (ev) => {
         if (!lista.length) { zonaOpciones.replaceChildren(el("p", { class: "muted" }, "No se encontraron otras opciones.")); return; }
         const grilla = el("div", { class: "candidatas" });
         const elegir = (c) => {
-          ficha.replaceWith(ficha = fichaResultado(texto, { ...candidataComoResultado(c, r), Estado: "Elegida a mano", Revisar: null }, modo));
+          actual = { ...candidataComoResultado(c, r), Estado: "Elegida a mano", Revisar: null };
+          ficha.replaceWith(ficha = fichaResultado(texto, actual, modo));
+          btnGuardar.disabled = false; btnGuardar.textContent = "💾 Guardar como correcto";
           grilla.querySelectorAll(".cand").forEach((x) => x.classList.toggle("elegida", x.title === (c.match_nombre || c.imagen_url)));
         };
         grilla.append(...lista.map((c) => tarjetaCandidata(c, elegir)));
@@ -468,7 +500,17 @@ $("formIndividual").addEventListener("submit", async (ev) => {
       } finally { btnOpciones.disabled = false; }
     };
     let ficha = fichaResultado(texto, r, modo);
-    $("resInd").replaceChildren(ficha, el("div", { class: "fila-btns" }, btnOpciones), zonaOpciones);
+    let actual = r;
+    const btnGuardar = el("button", { type: "button", class: "btn", title: "Lo guarda en el catálogo del equipo como confirmado" },
+                          "💾 Guardar como correcto");
+    btnGuardar.disabled = !CONFIG.catalogo.ok || !(r.EAN || r.Imagen_URL);
+    btnGuardar.onclick = async () => {
+      btnGuardar.disabled = true;
+      const ok = await confirmarEnCatalogo(texto, actual);
+      btnGuardar.textContent = ok ? "✓ Guardado en el catálogo" : "❌ No se pudo guardar";
+      if (!ok) btnGuardar.disabled = false;
+    };
+    $("resInd").replaceChildren(ficha, el("div", { class: "fila-btns" }, btnOpciones, btnGuardar), zonaOpciones);
   } catch (e) {
     $("resInd").replaceChildren(el("div", { class: "error" }, `Error: ${e.message}`));
   } finally {
@@ -559,6 +601,7 @@ $("btnIniciar").addEventListener("click", async () => {
   const colNombre = $("colNombre").value, colEan = $("colEan").value, modo = modoElegido("modoLote");
   const soloOficiales = $("estrictoLote").checked;
   const validarIA = $("iaLote").value || null;
+  const usarCatalogo = usaCatalogo("catalogoLote");
   const indices = indicesAProcesar();
   const pendientes = indices.filter((i) => !L.resultados[i]);
   if (!pendientes.length) { $("estadoLote").textContent = "No quedan filas pendientes."; return; }
@@ -578,7 +621,8 @@ $("btnIniciar").addEventListener("click", async () => {
       if (!texto && !ean) { L.resultados[i] = { Estado: "Vacía" }; continue; }
       const k = `${texto.toLowerCase()}|${ean || ""}`;
       try {
-        if (!cache.has(k)) cache.set(k, buscarProducto({ texto, ean, modo, solo_oficiales: soloOficiales, validar_ia: validarIA }));
+        if (!cache.has(k)) cache.set(k, buscarProducto({ texto, ean, modo, solo_oficiales: soloOficiales, validar_ia: validarIA,
+                                                         usar_catalogo: usarCatalogo }));
         L.resultados[i] = { ...(await cache.get(k)) };
       } catch (e) {
         cache.delete(k);
@@ -690,8 +734,13 @@ const R = { filtro: "pendientes", pagina: 0, candidatas: new Map() };
 const POR_PAGINA = 8;
 const FILTROS_REV = [["pendientes", "Pendientes"], ["revisados", "Ya revisados"], ["todos", "Todos"]];
 
+const confirmadoEnCatalogo = (r) => [r.Fuente_EAN, r.Fuente_Imagen].some((f) => String(f || "").includes("(confirmado)"));
+
 function tieneProblema(r) {
-  return r && !["Vacía"].includes(r.Estado) && (r.Estado !== "OK" || !!r.Revisar || r.Revisado_Manual);
+  if (!r || r.Estado === "Vacía") return false;
+  if (r.Revisado_Manual) return true;
+  if (confirmadoEnCatalogo(r)) return false; // ya lo revisó una persona del equipo
+  return r.Estado !== "OK" || !!r.Revisar;
 }
 
 function indicesRevision(filtro = R.filtro) {
@@ -722,6 +771,23 @@ function guardarRevision(i, cambios) {
   guardarProgreso();
   actualizarVista();
   renderRevision();
+  // Lo que corrige una persona queda en el catálogo del equipo para las próximas búsquedas
+  if (usaCatalogo("catalogoLote") && (r.EAN || r.Imagen_URL)) {
+    confirmarEnCatalogo(nombreFila(i) || r.EAN, r).then((ok) => {
+      L.resultados[i] = { ...L.resultados[i], En_Catalogo: ok ? "Sí" : "Error" };
+      guardarProgreso();
+    });
+  }
+}
+
+async function confirmarEnCatalogo(nombre, resultado) {
+  try {
+    const r = await api("/api/catalogo", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ accion: "confirmar", nombre, resultado }),
+    });
+    return r.ok;
+  } catch { return false; }
 }
 
 function cargarCandidatas(i) {
@@ -1039,12 +1105,125 @@ function configurarIA() {
   });
 }
 
+// La casilla queda marcada por defecto; solo cuenta si el catálogo está disponible
+const usaCatalogo = (id) => !!CONFIG.catalogo?.ok && $(id).checked;
+
+function configurarCatalogo() {
+  const ok = !!CONFIG.catalogo?.ok;
+  document.querySelectorAll(".usar-catalogo").forEach((c) => { c.disabled = !ok; });
+  document.querySelectorAll(".nota-catalogo").forEach((n) => {
+    n.textContent = ok ? `Lo ya confirmado sale al instante (${CONFIG.catalogo.productos ?? 0} productos guardados)`
+                       : `No disponible: ${CONFIG.catalogo?.detalle || "sin configurar"}`;
+  });
+}
+
+// ------------------------------------------------------------ pestaña catálogo
+const C = { pagina: 0, total: 0, porPagina: 50, filas: [] };
+
+async function pedirCatalogo(pagina, texto, confirmados) {
+  const q = new URLSearchParams({ pagina, q: texto, confirmados: confirmados ? "1" : "0" });
+  const r = await api(`/api/catalogo?${q}`);
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+  return d;
+}
+
+let temporizadorCat = null;
+async function cargarCatalogo() {
+  if (!CONFIG.catalogo?.ok) {
+    $("catEstado").textContent = `El catálogo no está disponible: ${CONFIG.catalogo?.detalle || "sin configurar"}.`;
+    $("catTbody").replaceChildren(); $("catPaginas").replaceChildren();
+    return;
+  }
+  $("catEstado").textContent = "Cargando…";
+  try {
+    const d = await pedirCatalogo(C.pagina, $("catBuscar").value.trim(), $("catConfirmados").checked);
+    Object.assign(C, { total: d.total, porPagina: d.por_pagina, filas: d.filas });
+    renderCatalogo();
+  } catch (e) {
+    $("catEstado").textContent = `❌ ${e.message}`;
+  }
+}
+
+function renderCatalogo() {
+  const paginas = Math.max(1, Math.ceil(C.total / C.porPagina));
+  $("catTitulo").textContent = `Catálogo del equipo · ${C.total} productos`;
+  $("catEstado").textContent = C.total ? "" : "Todavía no hay productos guardados con este filtro.";
+  $("catTbody").replaceChildren(...C.filas.map((f) => {
+    const borrar = el("button", { type: "button", class: "copiar", title: "Borrar del catálogo" }, "🗑");
+    borrar.onclick = async () => {
+      if (!confirm(`¿Borrar "${f.nombre_original || f.ean}" del catálogo? No se puede deshacer.`)) return;
+      const r = await api("/api/catalogo", { method: "POST", headers: { "Content-Type": "application/json" },
+                                             body: JSON.stringify({ accion: "borrar", id: f.id }) });
+      if (r.ok) cargarCatalogo(); else alert("No se pudo borrar.");
+    };
+    return el("tr", {},
+      el("td", {}, f.imagen_url ? el("img", { src: f.imagen_url, loading: "lazy", alt: "", referrerPolicy: "no-referrer" }) : ""),
+      el("td", { class: "nombre" }, f.nombre_original || ""),
+      el("td", {}, f.ean || ""),
+      el("td", { class: "nombre" }, f.match_nombre || ""),
+      el("td", {}, f.marca || ""),
+      el("td", { class: "nombre" }, f.categoria || ""),
+      el("td", {}, f.contenido_neto || ""),
+      el("td", { title: f.confirmado ? "Confirmado por una persona" : "Guardado automáticamente" }, f.confirmado ? "✓" : ""),
+      el("td", {}, f.usos ?? 0),
+      el("td", {}, f.actualizado ? new Date(f.actualizado).toLocaleDateString("es-AR") : ""),
+      el("td", {}, borrar),
+    );
+  }));
+  const nav = [];
+  if (paginas > 1) {
+    const ant = el("button", { type: "button", class: "btn", disabled: C.pagina === 0 }, "← Anterior");
+    ant.onclick = () => { C.pagina--; cargarCatalogo(); };
+    const sig = el("button", { type: "button", class: "btn", disabled: C.pagina >= paginas - 1 }, "Siguiente →");
+    sig.onclick = () => { C.pagina++; cargarCatalogo(); };
+    nav.push(ant, el("span", { class: "muted", style: "align-self:center" }, `Página ${C.pagina + 1} de ${paginas}`), sig);
+  }
+  $("catPaginas").replaceChildren(...nav);
+}
+
+$("catBuscar").addEventListener("input", () => {
+  clearTimeout(temporizadorCat);
+  temporizadorCat = setTimeout(() => { C.pagina = 0; cargarCatalogo(); }, 350);
+});
+$("catConfirmados").addEventListener("change", () => { C.pagina = 0; cargarCatalogo(); });
+
+$("btnExportarCat").addEventListener("click", async () => {
+  const btn = $("btnExportarCat");
+  btn.disabled = true;
+  try {
+    const todas = [];
+    for (let p = 0; ; p++) {
+      $("catEstado").textContent = `Descargando catálogo… ${todas.length} productos`;
+      const d = await pedirCatalogo(p, $("catBuscar").value.trim(), $("catConfirmados").checked);
+      todas.push(...d.filas);
+      if (todas.length >= d.total || !d.filas.length) break;
+    }
+    const columnas = ["nombre_original", "ean", "match_nombre", "marca", "categoria", "contenido_neto", "descripcion",
+                      "imagen_url", "link_producto", "fuente_ean", "fuente_imagen", "score", "confirmado", "usos", "actualizado"];
+    const libro = new ExcelJS.Workbook();
+    const hoja = libro.addWorksheet("Catálogo", { views: [{ state: "frozen", ySplit: 1 }] });
+    hoja.columns = columnas.map((c) => ({ header: c, key: c, width: ["descripcion", "imagen_url", "link_producto", "match_nombre", "nombre_original"].includes(c) ? 40 : 18,
+                                          style: c === "ean" ? { numFmt: "@" } : {} }));
+    hoja.getRow(1).font = { bold: true };
+    for (const f of todas) hoja.addRow({ ...f, confirmado: f.confirmado ? "Sí" : "No" });
+    const buffer = await libro.xlsx.writeBuffer();
+    descargarBlob(new Blob([buffer], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }),
+                  `catalogo_equipo_${new Date().toISOString().slice(0, 10)}.xlsx`);
+    $("catEstado").textContent = `📥 Exportados ${todas.length} productos.`;
+  } catch (e) {
+    $("catEstado").textContent = `❌ No se pudo exportar: ${e.message}`;
+  } finally { btn.disabled = false; }
+});
+
 (async () => {
   configurarIA();
+  configurarCatalogo();
   try {
     const r = await fetch("/api/estado");
     CONFIG = { ...CONFIG, ...(await r.json()) };
     configurarIA();
+    configurarCatalogo();
     if (CONFIG.tiendas?.length) {
       $("subtitulo").textContent = `Busca en ${CONFIG.tiendas.length} supermercados, farmacias y perfumerías ` +
         `(${CONFIG.tiendas.join(", ")}), con fallback web y filtro anti-marcas de agua.`;
