@@ -88,17 +88,28 @@ Cada producto confirmado queda guardado en una base de datos compartida, así na
 - **Se guarda solo:** todo resultado completo y confiable (EAN + foto, sin nada para revisar).
 - **Lo que corrige una persona tiene prioridad:** las elecciones de la pantalla de revisión y el botón **💾 Guardar como correcto** de la consulta individual se guardan como *confirmados*, y ninguna búsqueda automática los pisa. Sirve también para productos de mayorista que no están en ninguna tienda (por ejemplo, solo con la foto).
 - **Pestaña 📚 Catálogo:** buscar, ver cuántas veces se reutilizó cada producto, borrar y **exportar todo a Excel** (tu catálogo maestro).
+- **Reconoce el mismo producto escrito distinto:** "x500 gr", "500G" y "0,5 kg" son lo mismo, y "CAFE … BONAF" se reconoce como "Cafe … Bonafide". Si un nombre solo *se parece* a uno guardado (por ejemplo "ARROZ LUCATO 4 CEROS" y "ARROZ LUCATO 0000"), no se usa automáticamente: aparece como primera opción en la pantalla de revisión, con su % de parecido. Variantes distintas (negro/blanco, con sal/sin sal, otro sabor, otro tamaño, x25/x50 saquitos) nunca se mezclan.
 - Casilla **Usar catálogo del equipo** para buscar ignorándolo (en consola: `--sin-catalogo`).
 
 ### Configuración (una sola vez)
 
-1. **Crear la tabla:** en Supabase, *SQL Editor → New query*, pegar el contenido de [`supabase_catalogo.sql`](supabase_catalogo.sql) y *Run*.
+1. **Crear la tabla:** en Supabase, *SQL Editor → New query*, pegar el contenido de [`supabase_catalogo.sql`](supabase_catalogo.sql) y *Run*. Después, lo mismo con [`supabase_similares.sql`](supabase_similares.sql) (búsqueda de productos parecidos).
 2. **Vercel:** *Settings → Environment Variables*, agregar y hacer *Redeploy*:
    - `SUPABASE_URL` = `https://<tu-proyecto>.supabase.co`
    - `SUPABASE_KEY` = la clave secreta (`sb_secret_...`, en Supabase: *Project Settings → API Keys*)
 3. **En tu PC (consola, Gradio, `dev_server.py`):** archivo `.env` en esta carpeta con esas dos líneas. Git lo ignora, así que la clave no se sube a GitHub.
 
 La clave secreta da acceso total a la base: va solo en el servidor (Vercel o `.env`), nunca en la página ni en el código. La tabla tiene RLS activado, así que la clave pública de Supabase no puede leerla.
+
+## Pruebas automáticas
+
+`tests/test_limpieza.py` tiene ~170 pruebas con nombres reales de `productos.xlsx`: limpieza de nombres, detección de tamaños, contenido neto, EAN, marcas y claves del catálogo. No usan internet y tardan unos segundos:
+
+```bash
+python -m pytest
+```
+
+Correrlas después de tocar cualquier regla de limpieza. Si alguna falla, ver si el resultado nuevo es mejor (y actualizar la prueba) o si se rompió un caso que antes andaba.
 
 ## Pantalla de revisión
 

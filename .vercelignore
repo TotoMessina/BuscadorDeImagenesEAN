@@ -13,3 +13,5 @@ dev_server.py
 requirements-local.txt
 .env
 supabase_catalogo.sql
+tests/
+supabase_similares.sql

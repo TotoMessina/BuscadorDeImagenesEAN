@@ -50,3 +50,5 @@ $$;
 alter table public.productos_catalogo enable row level security;
 revoke all on public.productos_catalogo from anon, authenticated;
 revoke execute on function public.catalogo_sumar_uso(bigint) from anon, authenticated, public;
+
+-- Después de esto, ejecutar también supabase_similares.sql (búsqueda de productos parecidos).

@@ -377,7 +377,8 @@ $("btnDiag").addEventListener("click", async () => {
       el("strong", {}, caidas ? `${caidas} fuente(s) no responden` : "Todas las fuentes responden"),
       el("p", { class: "muted" }, `Región del servidor: ${d.region} · Serper (Google): ${d.serper_configurado ? "configurado" : "no configurado"}` +
         ` · Validación con IA: ${d.ia_disponible ? d.modelo_ia : "no configurada"}` +
-        ` · Catálogo del equipo: ${d.catalogo?.ok ? `conectado (${d.catalogo.productos} productos)` : d.catalogo?.detalle || "no configurado"}`),
+        ` · Catálogo del equipo: ${d.catalogo?.ok ? `conectado (${d.catalogo.productos} productos` +
+          `${d.catalogo.similares ? ", búsqueda de parecidos activa" : ", falta supabase_similares.sql"})` : d.catalogo?.detalle || "no configurado"}`),
       lista,
     );
   } catch (e) {

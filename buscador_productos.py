@@ -33,6 +33,7 @@ import os
 import re
 import sys
 import json
+import html
 import time
 import argparse
 import unicodedata
@@ -93,6 +94,7 @@ ABREVIATURAS = {
     r'\bgde\b': 'grande',
     r'\bch\b': 'chico',
     r'\bfiamb\b': 'fiambre',
+    r'\brell\b': 'relleno',
 }
 
 # Palabras genéricas que NO representan marcas ni características distintivas únicas
@@ -203,14 +205,26 @@ def extraer_eans_de_texto(texto):
     return validos
 
 
+_RE_TAMANO = re.compile(r'(?<![\d.,])(\d+(?:[.,]\d+)?)\s*(' + _UNIDADES + r')(?![a-z])')
+_RE_TAMANO_CON_X = re.compile(r'x\s*(\d+(?:[.,]\d+)?)\s*(' + _UNIDADES + r')(?![a-z])')
+
+
+def _buscar_tamano(texto):
+    """
+    Encuentra el tamaño en un nombre. Prefiere el marcado con "x" (la convención de las listas:
+    "CONITOS 5G QUESO x900 gr" -> 900 g, no 5 g); si no hay, toma el primero que aparezca.
+    """
+    t = normalizar_texto(texto)
+    return _RE_TAMANO_CON_X.search(t) or _RE_TAMANO.search(t)
+
+
 def extraer_tamano(texto):
     """
     Extrae la cantidad en gramos o mililitros para comparar variantes.
     Retorna el valor numérico normalizado (1 kg = 1000 gr, 1,5 lt = 1500 ml).
     Funciona con formatos pegados como 'x473ml', 'x80g.', '1.5 LT', '150 Grs'.
     """
-    t = normalizar_texto(texto)
-    m = re.search(r'(?<![\d.,])(\d+(?:[.,]\d+)?)\s*(' + _UNIDADES + r')(?![a-z])', t)
+    m = _buscar_tamano(texto)
     if not m:
         return None
     try:
@@ -231,13 +245,17 @@ def limpiar_nombre_producto(raw_name):
     Ejemplo: 'DR LEMON VODKA POMELO 5% LATA x473 ml' -> 'dr lemon vodka pomelo lata 473 ml'
              'ALF.MARLEYx80g.NEGRO x20'             -> 'alfajor marley 80 g negro'
     """
-    name = normalizar_texto(raw_name)
+    name = normalizar_texto(html.unescape(str(raw_name or "")))  # "&#34;B&#34;" -> '"B"'
 
     # Puntos: separar palabras ("alf.marley") pero conservar decimales ("1.5")
     name = re.sub(r'(?<!\d)\.|\.(?!\d)', ' ', name)
 
-    # Eliminar porcentajes de formulación/alcohol: "5%"
-    name = re.sub(r'\d+(?:[.,]\d+)?\s*%', ' ', name)
+    # Eliminar porcentajes y grados de alcohol: "5%", "19°", "4,5°"
+    name = re.sub(r'\d+(?:[.,]\d+)?\s*[%°]', ' ', name)
+
+    # Cantidad de bulto delante del tamaño: "15 x180 gr" -> "x180 gr"
+    # (hasta 3 cifras: "FERNET 1882 x450 ml" conserva el 1882)
+    name = re.sub(r'\b\d{1,3}\s*x(?=\s*\d)', ' x', name)
 
     # Eliminar bultos "x20", "x 12 un", "x1 un" (pero NO "x473 ml" ni "x80g")
     name = re.sub(
@@ -251,7 +269,8 @@ def limpiar_nombre_producto(raw_name):
     # Eliminar sufijos de empaque restantes
     name = re.sub(r'\b\d+\s*(?:unid|unidades|un|u)\b', ' ', name)
     name = re.sub(r'\btiras\s+troquel.*', ' ', name)
-    name = re.sub(r'\bdisplay\b.*', ' ', name)
+    # "display" (y su cantidad si quedó), sin borrar lo que viene después: "DISPLAY X 12 UNID x50 gr" conserva "50 gr"
+    name = re.sub(r'\bdisplay\b(?:\s*x?\s*\d+\s*(?:unid|unidades|un|u)\b)?', ' ', name)
     name = re.sub(r'\(caja exhibidora\)', ' ', name)
 
     # Reemplazar abreviaturas
@@ -262,7 +281,92 @@ def limpiar_nombre_producto(raw_name):
     name = re.sub(r'[*&%#$@()_+\-=\[\]{}|;:<>?/"\']', ' ', name)
     name = re.sub(r'(?<!\d),|,(?!\d)', ' ', name)
     name = re.sub(r'\s+', ' ', name).strip()
+    # "x" suelta que quedó de un bulto ("X 18 x35 gr")
+    name = re.sub(r'(?:^| )x(?= |$)', ' ', name)
+    name = re.sub(r'\s+', ' ', name).strip()
+    # Tamaño repetido: "X 950 ML x950 ml" -> "950 ml"
+    name = re.sub(r'\b(\d+(?:[.,]\d+)? ' + _UNIDADES + r')\b(?: \1\b)+', r'\1', name)
     return name
+
+
+def _tamano_canonico(numero, unidad):
+    """('1,5', 'lt') -> '1500ml', ('500', 'gr') -> '500g', ('1', 'kg') -> '1000g'."""
+    try:
+        valor = float(numero.replace(',', '.'))
+    except ValueError:
+        return f"{numero}{unidad}"
+    unidad = _UNIDAD_MOSTRAR.get(unidad, unidad)
+    if unidad == "kg":
+        valor, unidad = valor * 1000, "g"
+    elif unidad == "l":
+        valor, unidad = valor * 1000, "ml"
+    elif unidad == "mg":
+        valor, unidad = valor / 1000, "g"
+    texto = f"{valor:.3f}".rstrip("0").rstrip(".")
+    return f"{texto}{unidad}"
+
+
+def clave_catalogo(nombre):
+    """
+    Clave con la que se guarda un producto en el catálogo del equipo.
+    Es el nombre limpio con los tamaños escritos siempre igual, para que
+    "x500 gr", "500G" y "0,5 kg" den la misma clave.
+    """
+    nombre = str(nombre or "").strip()
+    if not nombre or nombre.isdigit():
+        return None
+    limpio = limpiar_nombre_producto(nombre)
+    limpio = re.sub(r'(?<![\d.,])(\d+(?:[.,]\d+)?)\s*(' + _UNIDADES + r')(?![a-z])',
+                    lambda m: _tamano_canonico(m.group(1), m.group(2)), limpio)
+    # La cantidad de unidades se conserva en la clave: en una lista "x25 un" puede ser el contenido
+    # (25 saquitos) y no el bulto, y confundir té x25 con té x50 sería peor que no reutilizarlo.
+    unidades = re.search(r'x\s*(\d+)\s*(?:unid|unidades|un|u)\b|x\s*(\d+)\s*$', normalizar_texto(nombre))
+    if unidades:
+        limpio += f" {unidades.group(1) or unidades.group(2)}u"
+    limpio = re.sub(r'\s+', ' ', limpio).strip()
+    return limpio[:300] or None
+
+
+# Palabras que no distinguen un producto de otro al comparar nombres del catálogo.
+# Ojo: colores, "con"/"sin" y sabores SÍ distinguen (alfajor negro ≠ blanco, con sal ≠ sin sal).
+_PALABRAS_NEUTRAS = {"de", "del", "la", "el", "los", "las", "y", "e", "en", "x", "para", "sabor", "tipo",
+                     "pack", "unidad", "unidades", "un", "u", "botella", "lata", "pet", "sobre", "bolsa",
+                     "caja", "doypack", "paquete", "envase"}
+_RE_TAMANO_CANON = re.compile(r'^\d+(?:\.\d+)?(?:g|ml|u)$')
+
+
+def _partes_clave(clave):
+    """Separa una clave en (tamaños, palabras distintivas)."""
+    tamanos, palabras = set(), set()
+    for t in str(clave or "").split():
+        if _RE_TAMANO_CANON.match(t):
+            tamanos.add(t)
+        elif t not in _PALABRAS_NEUTRAS and (len(t) >= 3 or t.isdigit()):
+            palabras.add(t)
+    return tamanos, palabras
+
+
+def _palabra_presente(palabra, otras):
+    # Coincidencia exacta, o una es abreviatura de la otra ("bonaf" / "bonafide")
+    return palabra in otras or any(len(min(palabra, o, key=len)) >= 4 and
+                                   (o.startswith(palabra) or palabra.startswith(o)) for o in otras)
+
+
+def es_mismo_producto(clave_a, clave_b):
+    """
+    ¿Dos claves del catálogo son el mismo producto aunque estén escritas distinto?
+    Criterio conservador: mismo tamaño y ninguna palabra distintiva de más en ninguna de las dos.
+    "arroz lucato 4 ceros 500g" vs "arroz lucato 0000 500g" -> False (solo se sugiere, no se usa solo).
+    """
+    if not clave_a or not clave_b:
+        return False
+    if clave_a == clave_b:
+        return True
+    tam_a, pal_a = _partes_clave(clave_a)
+    tam_b, pal_b = _partes_clave(clave_b)
+    if tam_a != tam_b or not pal_a or not pal_b:
+        return False
+    return all(_palabra_presente(p, pal_b) for p in pal_a) and all(_palabra_presente(p, pal_a) for p in pal_b)
 
 
 # =============================================================================
@@ -329,8 +433,7 @@ _UNIDAD_MOSTRAR = {"kg": "kg", "kgs": "kg", "kgr": "kg", "kgrs": "kg", "g": "g",
 
 def formatear_contenido(texto):
     """Contenido neto legible a partir de un nombre: 'Dr Lemon lata 473 cc.' -> '473 ml', '2,25 lts' -> '2,25 l'."""
-    t = normalizar_texto(texto)
-    m = re.search(r'(?<![\d.,])(\d+(?:[.,]\d+)?)\s*(' + _UNIDADES + r')(?![a-z])', t)
+    m = _buscar_tamano(texto)
     if not m:
         return None
     numero = m.group(1).replace('.', ',')
@@ -510,6 +613,33 @@ def buscar_por_ean_vtex(ean):
 SCORE_MINIMO_CANDIDATAS = 45  # más permisivo que la búsqueda automática: es una persona la que elige
 
 
+def _candidatas_catalogo(texto, limite=4):
+    """Productos del catálogo del equipo con el mismo nombre o uno parecido, como opciones para elegir."""
+    clave = clave_catalogo(texto)
+    if not clave or not catalogo.catalogo_disponible():
+        return []
+    filas = []
+    exacta = catalogo.buscar(clave)
+    if exacta:
+        filas.append({**exacta, "similitud": 1.0})
+    filas += catalogo.similares(clave, limite=limite, umbral=SIMILITUD_MINIMA_SUGERENCIA)
+    opciones = []
+    for f in filas:
+        if not f.get("imagen_url"):
+            continue
+        porcentaje = round(float(f.get("similitud") or 0) * 100)
+        etiqueta = "Catálogo del equipo" + (" ✓" if f.get("confirmado") else "")
+        etiqueta += " · mismo nombre" if porcentaje >= 100 else f" · {porcentaje}% parecido"
+        opciones.append({
+            "ean": f.get("ean"), "imagen_url": f.get("imagen_url"),
+            "match_nombre": f.get("nombre_original") or f.get("match_nombre"),
+            "tienda": None, "score": None, "fuente": etiqueta,
+            "categoria": f.get("categoria"), "contenido": f.get("contenido_neto"),
+            "descripcion": f.get("descripcion"), "link": f.get("link_producto"), "marca": f.get("marca"),
+        })
+    return opciones[:limite]
+
+
 def buscar_candidatas(texto, ean=None, incluir_web=True, max_vtex=8, max_web=4):
     """
     Opciones para la pantalla de revisión: productos parecidos de todas las tiendas VTEX
@@ -519,7 +649,7 @@ def buscar_candidatas(texto, ean=None, incluir_web=True, max_vtex=8, max_web=4):
     ean = normalizar_ean_celda(ean) or (texto if re.fullmatch(r'\d{8,14}', texto) else None)
     nombre_limpio = limpiar_nombre_producto(texto) if texto and not texto.isdigit() else ""
     tamano = extraer_tamano(texto) if nombre_limpio else None
-    candidatas = []
+    candidatas = _candidatas_catalogo(texto)
 
     futuros = []
     if nombre_limpio:
@@ -542,6 +672,7 @@ def buscar_candidatas(texto, ean=None, incluir_web=True, max_vtex=8, max_web=4):
     vtex.sort(key=lambda c: (-c["score"], PRIORIDAD_TIENDA.get(c["tienda"], 99)))
 
     vistos = {c["ean"] or c["imagen_url"] for c in candidatas}
+    max_vtex += len(candidatas)  # las del catálogo no cuentan para el límite de opciones de tiendas
     for c in vtex:
         clave = c["ean"] or c["imagen_url"]
         if clave in vistos:
@@ -916,13 +1047,19 @@ def procesar_un_producto(
     ean_conocido = normalizar_ean_celda(ean_conocido)
 
     # 0. Catálogo del equipo: si el producto ya está, se responde al instante
-    clave_cat = catalogo.clave_producto(limpiar_nombre_producto(nombre_original)) if not nombre_original.isdigit() else None
+    clave_cat = clave_catalogo(nombre_original)
     usar_catalogo = usar_catalogo and catalogo.catalogo_disponible()
     if usar_catalogo:
         fila = catalogo.buscar(clave_cat, ean_conocido)
         if fila and _fila_catalogo_sirve(fila, modo, ean_conocido):
             catalogo.sumar_uso(fila.get("id"))
             return _resultado_desde_catalogo(fila, modo, ean_conocido, nombre_original, carpeta_imagenes)
+        # Mismo producto escrito distinto ("CAFE ... BONAF x500 gr" / "Cafe ... Bonafide 500g")
+        for parecida in catalogo.similares(clave_cat, limite=3, umbral=SIMILITUD_MINIMA_AUTOMATICA):
+            if es_mismo_producto(clave_cat, parecida.get("clave")) and _fila_catalogo_sirve(parecida, modo, ean_conocido):
+                catalogo.sumar_uso(parecida.get("id"))
+                return _resultado_desde_catalogo(parecida, modo, ean_conocido, nombre_original, carpeta_imagenes,
+                                                 parecido_a=parecida.get("nombre_original") or parecida.get("clave"))
 
     necesita_ean = modo in ("ambos", "ean") and not ean_conocido
     necesita_img = modo in ("ambos", "imagen")
@@ -1092,6 +1229,10 @@ def procesar_un_producto(
     return resultado
 
 
+SIMILITUD_MINIMA_AUTOMATICA = 0.6   # para reutilizar solo un producto escrito distinto (además de es_mismo_producto)
+SIMILITUD_MINIMA_SUGERENCIA = 0.3   # para mostrarlo como opción en la pantalla de revisión
+
+
 def _fila_catalogo_sirve(fila, modo, ean_conocido):
     """¿Alcanza lo que hay en el catálogo para responder sin buscar?"""
     if ean_conocido and fila.get("ean") and fila["ean"] != ean_conocido:
@@ -1102,10 +1243,12 @@ def _fila_catalogo_sirve(fila, modo, ean_conocido):
                  "ean": fila.get("ean"), "imagen": fila.get("imagen_url")}[modo])
 
 
-def _resultado_desde_catalogo(fila, modo, ean_conocido, nombre_original, carpeta_imagenes):
+def _resultado_desde_catalogo(fila, modo, ean_conocido, nombre_original, carpeta_imagenes, parecido_a=None):
     ean = ean_conocido or fila.get("ean")
     img_url = fila.get("imagen_url") if modo != "ean" else None
     origen = "Catálogo del equipo" + (" (confirmado)" if fila.get("confirmado") else "")
+    if parecido_a:
+        origen += f" · igual a «{parecido_a}»"
     ruta_local = None
     if img_url and carpeta_imagenes:
         ruta_local = descargar_imagen(img_url, os.path.join(carpeta_imagenes, ean or nombre_archivo_seguro(nombre_original)))
@@ -1134,9 +1277,7 @@ def _resultado_desde_catalogo(fila, modo, ean_conocido, nombre_original, carpeta
 def registro_catalogo(nombre_original, resultado):
     """Arma la fila para el catálogo a partir de un resultado del buscador (o de una corrección manual)."""
     nombre_original = str(nombre_original or "").strip()
-    clave = None
-    if nombre_original and not nombre_original.isdigit():
-        clave = catalogo.clave_producto(limpiar_nombre_producto(nombre_original))
+    clave = clave_catalogo(nombre_original)
     ean = normalizar_ean_celda(resultado.get("EAN"))
     if not clave and ean:
         clave = f"ean:{ean}"  # productos cargados solo por código

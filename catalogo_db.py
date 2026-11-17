@@ -78,7 +78,8 @@ def estado_catalogo():
             global _error_config
             _error_config = None  # la conexión anda: se levanta cualquier pausa por error
             total = r.headers.get("Content-Range", "").split("/")[-1]
-            return {"ok": True, "detalle": "conectado", "productos": int(total) if total.isdigit() else None}
+            return {"ok": True, "detalle": "conectado", "productos": int(total) if total.isdigit() else None,
+                    "similares": similares_disponible()}
         return {"ok": False, "detalle": _explicar_error(r), "productos": None}
     except requests.RequestException as e:
         return {"ok": False, "detalle": f"sin conexión ({type(e).__name__})", "productos": None}
@@ -133,6 +134,46 @@ def buscar(clave=None, ean=None):
         if filas:
             return filas[0]
     return None
+
+
+_similares_pausa_hasta = 0.0  # si falta la función en Supabase, no reintentar en cada producto
+
+
+def similares(clave, limite=5, umbral=0.4):
+    """
+    Productos del catálogo con nombre parecido (función catalogo_similares, ver supabase_similares.sql).
+    Devuelve una lista de filas con el campo extra "similitud" (0 a 1), o [] si no está disponible.
+    """
+    global _similares_pausa_hasta
+    if not catalogo_disponible() or not clave or time.time() < _similares_pausa_hasta:
+        return []
+    try:
+        r = _sesion.post(f"{_base()}/rest/v1/rpc/catalogo_similares",
+                         json={"p_clave": clave, "p_limite": int(limite), "p_umbral": float(umbral)},
+                         headers=_headers(), timeout=_TIMEOUT)
+    except requests.RequestException:
+        return []
+    if r.status_code != 200:
+        if r.status_code == 404:
+            if time.time() >= _similares_pausa_hasta:
+                print("[CATÁLOGO] Falta la búsqueda de parecidos: ejecutá supabase_similares.sql en Supabase",
+                      file=sys.stderr, flush=True)
+            _similares_pausa_hasta = time.time() + _PAUSA_ERROR
+        return []
+    return r.json() or []
+
+
+def similares_disponible():
+    """Para el diagnóstico: ¿está instalada la función de búsqueda de parecidos?"""
+    if not catalogo_disponible():
+        return False
+    try:
+        r = _sesion.post(f"{_base()}/rest/v1/rpc/catalogo_similares",
+                         json={"p_clave": "prueba", "p_limite": 1, "p_umbral": 0.99},
+                         headers=_headers(), timeout=_TIMEOUT)
+        return r.status_code == 200
+    except requests.RequestException:
+        return False
 
 
 def sumar_uso(id_fila):
